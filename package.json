@@ -1,0 +1,22 @@
+{
+  "name": "neon-city",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pixel art neon city visualization for Claude Code multi-agent workflows",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w server && npm run build -w client",
+    "test": "npm run test -w server && npm run test -w client",
+    "setup": "node bin/setup.js",
+    "setup:uninstall": "node bin/setup.js --uninstall"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  }
+}
