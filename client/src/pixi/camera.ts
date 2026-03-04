@@ -54,7 +54,7 @@ export class Camera {
       maxX: screenW * 0.5,
       minY: -screenH * 0.3,
       maxY: screenH * 0.3,
-      minZoom: 0.5,
+      minZoom: 0.2,
       maxZoom: 3,
       ...bounds,
     };
@@ -200,6 +200,88 @@ export class Camera {
     }
 
     this.applyTransform();
+  }
+
+  /**
+   * Fit the city into the viewport so buildings span the full width.
+   *
+   * contentWidth  — full world width (WORLD_WIDTH px).
+   * roadY         — world-space Y coordinate of the road surface.
+   * bottomMargin  — screen pixels to reserve below the road for the bottom bar.
+   *
+   * Uses width-based zoom only so all buildings are always visible with no
+   * horizontal cropping. The sky gradient fills the vertical space above
+   * the buildings (extended in sky-renderer.ts to cover any visible area).
+   */
+  fitCityToViewport(contentWidth: number, roadY: number, bottomMargin = 60) {
+    const screenW = this.app.screen.width;
+    const screenH = this.app.screen.height;
+    if (screenW <= 0 || screenH <= 0 || contentWidth <= 0) return;
+
+    // Width-based zoom: city fills the viewport horizontally
+    const fitZoom = screenW / contentWidth;
+    const clampedFit = Math.min(fitZoom, this.bounds.maxZoom);
+    this._baseZoom = clampedFit;
+    this._zoom = clampedFit;
+
+    // Y bounds: set generous bounds so the vertical pan that anchors the road
+    // at the bottom is never clamped away.
+    const maxPanY = screenH / this._zoom;
+    this.bounds.minY = -maxPanY;
+    this.bounds.maxY = maxPanY;
+
+    // Center the world horizontally: shift so world midpoint aligns with
+    // screen midpoint. The pivot is at screenW/2 in world coords, so when
+    // contentWidth ≠ screenW the default panX=0 leaves the city off-center.
+    const panX = (screenW - contentWidth) / 2;
+
+    // X bounds: accommodate the centering offset + any scroll room
+    const scaledWorldW = contentWidth * this._zoom;
+    const excessX = Math.max(0, (scaledWorldW - screenW) / 2 / this._zoom);
+    const centerPad = Math.abs(panX) + 50;
+    this.bounds.minX = -(excessX + centerPad);
+    this.bounds.maxX = excessX + centerPad;
+
+    // Road strip extends 85px below roadY (60px road + 25px car strip).
+    const roadBottomWorldY = roadY + 85; // 60px road + 25px car strip
+    const targetScreenY = screenH - bottomMargin;
+
+    // Derive panY so that world point roadBottomWorldY maps to targetScreenY.
+    // Screen coordinate formula (from applyTransform + pivot):
+    //   sy = (wy - screenH/2) * zoom + screenH/2 + panY*zoom
+    // Solving for panY:
+    //   panY = (targetScreenY - screenH/2) / zoom - (roadBottomWorldY - screenH/2)
+    const panY = (targetScreenY - screenH / 2) / this._zoom - (roadBottomWorldY - screenH / 2);
+
+    this._panX = panX;
+    this._panY = Math.max(this.bounds.minY, Math.min(this.bounds.maxY, panY));
+
+    this.applyTransform();
+  }
+
+  /**
+   * Update the pan bounds to accommodate a wider/taller world.
+   * Call this after building the city with a new world size so the user
+   * can pan across the full extent without the camera clipping at old
+   * screen-width limits.
+   *
+   * minX / maxX are set so the world edges stay reachable:
+   *   panX range = [-(worldWidth - screenWidth)/2, (worldWidth - screenWidth)/2]
+   * which centres the world at panX=0 and lets the user reach both edges.
+   */
+  setWorldSize(worldWidth: number, worldHeight?: number) {
+    const screenW = this.app.screen.width;
+    const screenH = this.app.screen.height;
+
+    // Half the "excess" world beyond the viewport — this is how far the user
+    // can pan left or right before the world edge exits the screen.
+    const excessX = Math.max(0, (worldWidth - screenW) / 2);
+    const excessY = worldHeight != null ? Math.max(0, (worldHeight - screenH) / 2) : this.bounds.maxY;
+
+    this.bounds.minX = -excessX;
+    this.bounds.maxX = excessX;
+    this.bounds.minY = -excessY;
+    this.bounds.maxY = excessY;
   }
 
   setPan(x: number, y: number) {

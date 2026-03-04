@@ -32,8 +32,15 @@ export class CloudLayer {
     this.generateClouds();
   }
 
+  private _isDay = false;
+
   set opacity(v: number) {
     this._opacity = Math.max(0, Math.min(1, v));
+  }
+
+  /** Switch cloud color between night (blue-gray) and day (white). */
+  setDaytime(isDay: boolean) {
+    this._isDay = isDay;
   }
 
   private generateClouds() {
@@ -99,7 +106,9 @@ export class CloudLayer {
           seg.rx,
           seg.ry
         );
-        this.graphics.fill({ color: 0x8888bb, alpha });
+        const cloudColor = this._isDay ? 0xddddee : 0x8888bb;
+        const dayAlpha = this._isDay ? alpha * 3 : alpha; // Clouds more visible during day
+        this.graphics.fill({ color: cloudColor, alpha: dayAlpha });
       }
     }
   }

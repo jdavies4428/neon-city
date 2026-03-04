@@ -113,6 +113,7 @@ export function HistoryDrawer({ open, onClose }: Props) {
             {/* Project filter */}
             <div className="drawer-filter">
               <select
+                name="drawer-project"
                 className="drawer-select"
                 value={selectedProject ?? ""}
                 onChange={(e) => setSelectedProject(e.target.value ? Number(e.target.value) : undefined)}
@@ -189,6 +190,7 @@ export function HistoryDrawer({ open, onClose }: Props) {
           <>
             <div className="drawer-filter">
               <input
+                name="drawer-search"
                 className="drawer-search-input"
                 type="text"
                 placeholder="Search across all sessions..."

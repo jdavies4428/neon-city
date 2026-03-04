@@ -23,7 +23,8 @@ export class Indexer {
     this.db = getDb(dataDir);
   }
 
-  /** Full index run — scan all projects and sessions */
+  /** Full index run — scan all projects and sessions.
+   *  Yields the event loop between projects so HTTP/WS requests are never blocked. */
   async indexAll() {
     if (this.indexing) return;
     this.indexing = true;
@@ -42,6 +43,8 @@ export class Indexer {
         if (!dirStat?.isDirectory()) continue;
 
         await this.indexProject(dirName, dirPath);
+        // Yield so HTTP/WS handlers can run between projects
+        await new Promise((r) => setTimeout(r, 0));
       }
 
       console.log(`[Indexer] Indexed ${projectDirs.length} project directories`);
@@ -54,7 +57,9 @@ export class Indexer {
 
   /** Start watching for changes — re-index every 30 seconds */
   startWatching() {
-    this.watchTimer = setInterval(() => this.incrementalIndex(), 30_000);
+    this.watchTimer = setInterval(() => {
+      this.incrementalIndex().catch((err) => console.error("[Indexer] Incremental index error:", err));
+    }, 30_000);
   }
 
   stopWatching() {
@@ -77,6 +82,7 @@ export class Indexer {
         if (!dirStat?.isDirectory()) continue;
 
         await this.indexProject(dirName, dirPath);
+        await new Promise((r) => setTimeout(r, 0));
       }
     } catch {
       // Silent
@@ -110,7 +116,7 @@ export class Indexer {
       const sessionId = fileName.replace(".jsonl", "");
 
       try {
-        const fileStat = statSync(filePath);
+        const fileStat = await stat(filePath);
         const existing = this.db.prepare("SELECT last_indexed_offset, file_size FROM sessions WHERE id = ?").get(sessionId) as any;
 
         // Skip if file hasn't changed
@@ -149,32 +155,35 @@ export class Indexer {
           newOffset
         );
 
-        // Insert messages
+        // Insert messages in small batches to avoid blocking the event loop.
+        // better-sqlite3 transactions are synchronous — a single transaction
+        // with thousands of rows blocks all HTTP/WS handling for seconds.
+        const BATCH_SIZE = 50;
         const insertMsg = this.db.prepare(`
           INSERT INTO messages (session_id, role, content, timestamp, token_count, tool_name, file_path)
           VALUES (?, ?, ?, ?, ?, ?, ?)
         `);
-
-        const insertMany = this.db.transaction((msgs: typeof session.messages) => {
-          for (const msg of msgs) {
-            // Skip very large messages (tool results etc.)
-            const content = msg.content.length > 10000 ? msg.content.slice(0, 10000) : msg.content;
-            insertMsg.run(sessionId, msg.role, content, msg.timestamp, msg.tokenCount, msg.toolName, msg.filePath);
-          }
-        });
-
-        insertMany(session.messages);
-
-        // Track file changes
         const insertChange = this.db.prepare(`
           INSERT INTO file_changes (session_id, file_path, change_type, timestamp)
           VALUES (?, ?, ?, ?)
         `);
 
-        for (const msg of session.messages) {
-          if (msg.filePath && msg.toolName) {
-            const changeType = ["Write", "Edit"].includes(msg.toolName) ? "write" : "read";
-            insertChange.run(sessionId, msg.filePath, changeType, msg.timestamp);
+        const insertBatch = this.db.transaction((msgs: typeof session.messages) => {
+          for (const msg of msgs) {
+            const content = msg.content.length > 10000 ? msg.content.slice(0, 10000) : msg.content;
+            insertMsg.run(sessionId, msg.role, content, msg.timestamp, msg.tokenCount, msg.toolName, msg.filePath);
+            if (msg.filePath && msg.toolName) {
+              const changeType = ["Write", "Edit"].includes(msg.toolName) ? "write" : "read";
+              insertChange.run(sessionId, msg.filePath, changeType, msg.timestamp);
+            }
+          }
+        });
+
+        for (let i = 0; i < session.messages.length; i += BATCH_SIZE) {
+          insertBatch(session.messages.slice(i, i + BATCH_SIZE));
+          // Yield between batches so the server stays responsive
+          if (i + BATCH_SIZE < session.messages.length) {
+            await new Promise((r) => setTimeout(r, 0));
           }
         }
 
@@ -220,6 +229,17 @@ export class Indexer {
   }
 
   // ── Query methods ──────────────────────────────────
+
+  /** Return the indexed title for a single session, or null if not indexed yet.
+   *  This is a fast primary-key lookup — never scans files. */
+  getSessionTitle(sessionId: string): string | null {
+    try {
+      const row = this.db.prepare("SELECT title FROM sessions WHERE id = ?").get(sessionId) as any;
+      return row?.title || null;
+    } catch {
+      return null;
+    }
+  }
 
   getProjects() {
     return this.db.prepare(`

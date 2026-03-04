@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { formatTokens } from "../shared/format";
 
 interface Stats {
   activeAgents: number;
@@ -52,7 +53,7 @@ export function SessionStats({ liveAgentCount }: Props) {
         <span className="stat-label">sessions</span>
       </div>
       <div className="stat-divider" />
-      <div className="stat-item" title={`~${formatTokens(totalTokens)} tokens total, ~$${cost.toFixed(2)} estimated cost`}>
+      <div className="stat-item" title={`~${formatTokens(totalTokens, 1)} tokens total, ~$${cost.toFixed(2)} estimated cost`}>
         <span className="stat-value stat-cost">
           ${cost < 1 ? cost.toFixed(2) : cost < 100 ? cost.toFixed(1) : Math.round(cost)}
         </span>
@@ -60,10 +61,4 @@ export function SessionStats({ liveAgentCount }: Props) {
       </div>
     </div>
   );
-}
-
-function formatTokens(n: number): string {
-  if (n < 1000) return String(n);
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`;
-  return `${(n / 1_000_000).toFixed(1)}M`;
 }

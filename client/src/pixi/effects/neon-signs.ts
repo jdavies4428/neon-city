@@ -36,6 +36,15 @@ export class NeonSign {
 
     this.container.addChild(this.glow);
     this.container.addChild(this.label);
+
+    // Force text texture rebuild once the pixel font loads
+    // (initial render may use fallback monospace, producing a too-narrow texture)
+    document.fonts.ready.then(() => {
+      const original = this.label.text;
+      this.label.text = "";
+      this.label.text = original;
+      this.drawGlow(1);
+    });
   }
 
   private drawGlow(alpha: number) {

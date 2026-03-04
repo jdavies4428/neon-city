@@ -1,20 +1,22 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { initCityApp, destroyCityApp, resizeCityApp } from "./pixi/city-app";
-import { CityRenderer, type CityAgent } from "./pixi/city/city-renderer";
+import { CityRenderer } from "./pixi/city/city-renderer";
 import { useCityState } from "./hooks/useCityState";
+import type { HistoryProject } from "./hooks/useHistory";
+import { useCityAudio } from "./hooks/useCityAudio";
+import { useDesktopNotifications } from "./hooks/useDesktopNotifications";
 import { AgentStatusBar } from "./ui/AgentStatusBar";
 import { ChatPanel } from "./ui/ChatPanel";
 import { NotificationCenter } from "./ui/NotificationCenter";
 import { WeatherIndicator } from "./ui/WeatherIndicator";
 import { HistoryDrawer } from "./ui/HistoryDrawer";
 import { ProjectSwitcher } from "./ui/ProjectSwitcher";
-import { Minimap } from "./ui/Minimap";
 import { Tooltip } from "./ui/Tooltip";
 import { ClaudeLogo } from "./ui/ClaudeLogo";
 import { SessionStats } from "./ui/SessionStats";
-import { TokenMeter } from "./ui/TokenMeter";
+import { PowerGridModal } from "./ui/PowerGridModal";
 import { SpawnModal } from "./ui/SpawnModal";
-
+import { ProjectDetailModal } from "./ui/ProjectDetailModal";
 interface ActiveSession {
   sessionId: string;
   projectName: string;
@@ -37,8 +39,20 @@ export function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<CityRenderer | null>(null);
-  const { stateRef, subscribe, subscribeToMessages } = useCityState();
+  const { stateRef, subscribe, subscribeToMessages, notify } = useCityState();
+  const { permission: notifPermission, requestPermission } = useDesktopNotifications(subscribeToMessages);
   const [ready, setReady] = useState(false);
+
+  // Audio system — lazy-init on first user click
+  const audioControls = useCityAudio();
+  const audioInitedRef = useRef(false);
+  const handleRootClick = useCallback(() => {
+    if (!audioInitedRef.current) {
+      audioInitedRef.current = true;
+      audioControls.init();
+      if (notifPermission === "default") requestPermission();
+    }
+  }, [audioControls, notifPermission, requestPermission]);
 
   // Panel state
   const [chatOpen, setChatOpen] = useState(false);
@@ -48,11 +62,14 @@ export function App() {
   // Weather
   const [weather, setWeather] = useState({ state: "clear", reason: "Starting up" });
 
-  // History drawer + project switcher + spawn modal
+  // History drawer + project switcher + spawn modal + power grid modal
   const [historyOpen, setHistoryOpen] = useState(false);
   const [projectsOpen, setProjectsOpen] = useState(false);
   const [spawnOpen, setSpawnOpen] = useState(false);
   const [spawnContext, setSpawnContext] = useState<{ prompt?: string; projectPath?: string } | null>(null);
+  const [powerGridOpen, setPowerGridOpen] = useState(false);
+  const [projectDetailOpen, setProjectDetailOpen] = useState(false);
+  const [projectDetailProject, setProjectDetailProject] = useState<HistoryProject | null>(null);
 
   // Live agent count for header stats
   const [liveAgentCount, setLiveAgentCount] = useState(0);
@@ -62,21 +79,19 @@ export function App() {
     visible: false, x: 0, y: 0, title: "", type: "building",
   });
 
-  // Minimap state
-  const [minimapData, setMinimapData] = useState({
-    worldWidth: 0,
-    worldHeight: 0,
-    cameraX: 0,
-    cameraY: 0,
-    cameraZoom: 1,
-    screenWidth: 0,
-    screenHeight: 0,
-    agents: [] as Array<{ id: string; x: number; y: number; status: string }>,
-    roadYFraction: 0.72,
-  });
-
   // Active sessions for header logos
   const [activeSessions, setActiveSessions] = useState<ActiveSession[]>([]);
+
+  // Toggle a boolean state setter with panel open/close audio
+  const toggleWithAudio = useCallback(
+    (setter: React.Dispatch<React.SetStateAction<boolean>>) => () => {
+      setter((p) => {
+        if (!p) audioControls.playPanelOpen(); else audioControls.playPanelClose();
+        return !p;
+      });
+    },
+    [audioControls]
+  );
 
   // Initialize Pixi.js
   useEffect(() => {
@@ -112,6 +127,7 @@ export function App() {
               x: info.x,
               y: info.y,
               title: info.label,
+              details: info.details,
               type: info.type as "building" | "agent",
             });
           } else {
@@ -120,19 +136,7 @@ export function App() {
         },
       });
 
-      // Get world dimensions for minimap
-      const dims = renderer.getWorldDimensions();
-      setMinimapData((prev) => ({
-        ...prev,
-        worldWidth: dims.width,
-        worldHeight: dims.height,
-        screenWidth: app.screen.width,
-        screenHeight: app.screen.height,
-        roadYFraction: dims.roadYFraction,
-      }));
-
       setReady(true);
-      addDemoAgents(renderer);
     });
 
     return () => {
@@ -165,12 +169,6 @@ export function App() {
         // After the PixiJS renderer has been resized, tell the city renderer to
         // adjust the camera zoom so all world content stays visible.
         rendererRef.current?.onViewportResize(width, height);
-        // Keep the minimap viewport framing in sync with the actual canvas size.
-        setMinimapData((prev) => ({
-          ...prev,
-          screenWidth: width,
-          screenHeight: height,
-        }));
       }
     });
 
@@ -181,13 +179,8 @@ export function App() {
       const rect = el.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) {
         resizeCityApp(rect.width, rect.height);
-        // Same camera fit-to-width adjustment at transition end.
+        // Same camera fit-to-viewport adjustment at transition end.
         rendererRef.current?.onViewportResize(rect.width, rect.height);
-        setMinimapData((prev) => ({
-          ...prev,
-          screenWidth: rect.width,
-          screenHeight: rect.height,
-        }));
       }
     };
 
@@ -199,6 +192,34 @@ export function App() {
     };
   }, []);
 
+  // Wire error notifications and token stats to the city pulse
+  useEffect(() => {
+    if (!ready) return;
+
+    return subscribeToMessages((msg) => {
+      const renderer = rendererRef.current;
+      if (!renderer) return;
+
+      // Error notifications trigger a district flash in the pulse
+      if (msg.type === "notification" && msg.data?.type === "error") {
+        // Map agent to a district if available; fall back to "data"
+        const district: string = msg.data?.district ?? "data";
+        renderer.getPulse().onError(district);
+        audioControls.playErrorAlert();
+      }
+
+      // Non-error notifications get a chime
+      if (msg.type === "notification" && msg.data?.type !== "error") {
+        audioControls.playNotificationChime();
+      }
+
+      // Stats updates feed token counts into the pulse
+      if (msg.type === "stats" && typeof msg.data?.totalTokens === "number") {
+        renderer.getPulse().onTokenUpdate(msg.data.totalTokens as number);
+      }
+    });
+  }, [ready, subscribeToMessages]);
+
   // Sync WebSocket state -> Pixi renderer
   useEffect(() => {
     if (!ready) return;
@@ -207,9 +228,38 @@ export function App() {
       const renderer = rendererRef.current;
       if (!renderer) return;
 
-      let index = 0;
+      // --- Cross-update: propagate real-time WebSocket status to synthetic agents ---
+      // WebSocket agents use raw sessionId. Synthetic agents use "session-<sessionId>".
+      // The user sees the synthetic card (with project name), so we must keep it current.
+      // After syncing, DELETE the raw WebSocket entry so AgentStatusBar doesn't render duplicates.
+      const rawSessionIdsToDelete: string[] = [];
       for (const [id, agent] of state.agents) {
-        const pos = renderer.getAgentPosition(agent.status, index);
+        if (agent.agentKind === "session" && !id.startsWith("session-")) {
+          const syntheticId = `session-${id}`;
+          const synthetic = state.agents.get(syntheticId);
+          if (synthetic) {
+            synthetic.status = agent.status;
+            synthetic.currentCommand = agent.currentCommand;
+            synthetic.toolInput = agent.toolInput;
+            synthetic.lastActivity = agent.lastActivity;
+            synthetic.isThinking = agent.isThinking;
+            rawSessionIdsToDelete.push(id);
+          }
+        }
+      }
+      for (const id of rawSessionIdsToDelete) {
+        renderer.removeAgent(id);
+        state.agents.delete(id);
+      }
+
+      let index = 0;
+      let hasWriting = false;
+      let hasReading = false;
+      for (const [id, agent] of state.agents) {
+        const variant = agent.agentKind === "session" ? "session" : (agent.agentKind === "subagent" ? "agent" : undefined);
+        const pos = renderer.getAgentPosition(agent.status, agent.currentCommand, index, agent.agentType, agent.agentKind);
+        // Store colorIndex on agent state so AgentStatusBar uses the same value
+        agent.colorIndex = index;
         renderer.setAgent({
           agentId: id,
           displayName: agent.displayName,
@@ -217,13 +267,21 @@ export function App() {
           status: agent.status,
           currentCommand: agent.currentCommand,
           toolInput: agent.toolInput,
+          agentType: agent.agentType,
+          agentKind: agent.agentKind,
           x: pos.x,
           y: pos.y,
           targetX: pos.x,
           targetY: pos.y,
+          variant,
         });
+        if (agent.status === "writing") hasWriting = true;
+        if (agent.status === "reading") hasReading = true;
         index++;
       }
+      // Single pulse flush after all agents have been updated — O(N) instead of O(N²)
+      renderer.flushPulse();
+      audioControls.setAgentActivity(hasWriting, hasReading);
 
       // Sync weather — use functional update and only change state when
       // values actually differ to avoid cascading re-renders.
@@ -236,6 +294,7 @@ export function App() {
           ) {
             return prev; // same values → same reference → no re-render
           }
+          audioControls.setWeatherState(state.weather.state);
           return { state: state.weather.state, reason: state.weather.reason };
         });
       }
@@ -245,29 +304,10 @@ export function App() {
     });
   // stateRef is a React ref (stable object) — omitting it from deps is correct.
   // subscribe is a stable useCallback from useCityState.
-  }, [ready, subscribe]); // eslint-disable-line react-hooks/exhaustive-deps
+  // audioControls methods are stable useCallback refs.
+  }, [ready, subscribe, audioControls]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Update minimap periodically
-  useEffect(() => {
-    if (!ready) return;
-
-    const interval = setInterval(() => {
-      const renderer = rendererRef.current;
-      if (!renderer) return;
-
-      setMinimapData((prev) => ({
-        ...prev,
-        cameraX: renderer.camera.panX,
-        cameraY: renderer.camera.panY,
-        cameraZoom: renderer.camera.zoom,
-        agents: renderer.getAgentPositions(),
-      }));
-    }, 200);
-
-    return () => clearInterval(interval);
-  }, [ready]);
-
-  // Fetch active sessions for header logos
+  // Fetch active sessions for header logos and city citizens
   useEffect(() => {
     let cancelled = false;
 
@@ -276,8 +316,61 @@ export function App() {
         const res = await fetch("/api/sessions/active");
         if (!res.ok) return;
         const data = await res.json();
-        if (!cancelled) {
-          setActiveSessions(Array.isArray(data) ? data : (data.sessions ?? []));
+        if (cancelled) return;
+
+        const allSessions: ActiveSession[] = Array.isArray(data) ? data : (data.sessions ?? []);
+        setActiveSessions(allSessions);
+
+        // Convert live sessions into synthetic city agents
+        const liveSessions = allSessions.filter((s) => s.isLive);
+        const renderer = rendererRef.current;
+        if (renderer) {
+          for (let i = 0; i < liveSessions.length; i++) {
+            const session = liveSessions[i];
+            if (!session) continue;
+            const syntheticId = `session-${session.sessionId}`;
+            // Check if this session is already tracked via WebSocket (with richer state)
+            const wsAgent = stateRef.current.agents.get(session.sessionId);
+            const effectiveStatus = wsAgent?.status ?? (session.status === "idle" ? "idle" : "walking");
+            const effectiveCommand = wsAgent?.currentCommand;
+            const pos = renderer.getAgentPosition(
+              effectiveStatus,
+              effectiveCommand,
+              i,
+              undefined,
+              "session"
+            );
+            renderer.setAgent({
+              agentId: syntheticId,
+              displayName: session.projectName,
+              colorIndex: i % 5,
+              status: effectiveStatus,
+              currentCommand: effectiveCommand,
+              x: pos.x,
+              y: pos.y,
+              targetX: pos.x,
+              targetY: pos.y,
+              variant: "session",
+              agentKind: "session",
+              ideName: session.ideName,
+            });
+            // Add/update synthetic agent in state so AgentStatusBar shows the card
+            // Always update (not just first creation) so polling keeps status fresh
+            const existing = stateRef.current.agents.get(syntheticId);
+            stateRef.current.agents.set(syntheticId, {
+              agentId: syntheticId,
+              displayName: session.projectName,
+              source: "claude",
+              isThinking: false,
+              currentCommand: existing?.currentCommand ?? effectiveCommand,
+              toolInput: existing?.toolInput,
+              lastActivity: Date.now(),
+              status: existing?.status ?? effectiveStatus,
+              agentKind: "session",
+              colorIndex: existing?.colorIndex ?? i % 5,
+            });
+          }
+          notify(); // Trigger AgentStatusBar to pick up synthetic session agents
         }
       } catch {
         // silently ignore — server may not be up yet
@@ -290,7 +383,7 @@ export function App() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, []);
+  }, [notify]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -301,6 +394,7 @@ export function App() {
         setHistoryOpen(false);
         setProjectsOpen(false);
         setSpawnOpen(false);
+        setPowerGridOpen(false);
       }
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
@@ -334,31 +428,12 @@ export function App() {
   return (
     <>
       {/* Header */}
-      <div className="city-header">
+      <div className="city-header" onClick={handleRootClick}>
         <div className="header-brand">
           <div>
             <span className="city-title">NEON CITY</span>
             <span className="city-subtitle">CLAUDE CODE MISSION CONTROL</span>
           </div>
-          {activeSessions.filter(s => s.isLive).length > 0 && (
-            <div className="session-logos-col">
-              {activeSessions.filter(s => s.isLive).map((session) => (
-                <div key={session.sessionId} className="session-logo-item">
-                  <ClaudeLogo
-                    size={22}
-                    thinking={session.status !== "idle"}
-                    className="session-logo-icon"
-                  />
-                  <span
-                    className="session-logo-name"
-                    style={{ color: session.color || "#00f0ff" }}
-                  >
-                    {session.projectName}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
         <div className="header-actions">
           <SessionStats liveAgentCount={liveAgentCount} />
@@ -367,12 +442,19 @@ export function App() {
             reason={weather.reason}
             onSetWeather={(state) => {
               setWeather({ state, reason: "Manual override" });
-              rendererRef.current?.setWeather(state === "sunny" ? "clear" : state);
+              rendererRef.current?.setWeather(state, true);
+              audioControls.setWeatherState(state);
+              // Sync to server so WebSocket broadcasts the correct state
+              fetch("/api/weather/set", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ state, reason: "Manual override" }),
+              }).catch(() => {});
             }}
           />
           <button
             className={`glass-btn alerts-btn ${!notifOpen ? "police-flash" : ""}`}
-            onClick={() => setNotifOpen((p) => !p)}
+            onClick={toggleWithAudio(setNotifOpen)}
           >
             <span className="police-light" />
             <span>Alerts</span>
@@ -382,13 +464,13 @@ export function App() {
           </button>
           <button
             className="glass-btn"
-            onClick={() => setChatOpen((p) => !p)}
+            onClick={toggleWithAudio(setChatOpen)}
           >
             <span>Chat</span>
           </button>
           <button
             className="glass-btn"
-            onClick={() => setHistoryOpen((p) => !p)}
+            onClick={toggleWithAudio(setHistoryOpen)}
           >
             <span>History</span>
           </button>
@@ -398,11 +480,24 @@ export function App() {
           >
             <span>Projects</span>
           </button>
+          <button
+            className="glass-btn"
+            onClick={() => setSpawnOpen(true)}
+          >
+            <span>+ Agents</span>
+          </button>
+          <button
+            className="glass-btn"
+            onClick={() => setPowerGridOpen(true)}
+          >
+            <span>⚡ Power Grid</span>
+          </button>
         </div>
       </div>
 
-      {/* Canvas — shifts when side panels open */}
-      <div ref={wrapRef} className={canvasClass}>
+      {/* Canvas — shifts when side panels open.
+          Clicking the canvas also initialises the AudioContext (browser gesture requirement). */}
+      <div ref={wrapRef} className={canvasClass} onClick={handleRootClick}>
         <canvas ref={canvasRef} id="city-canvas" />
       </div>
 
@@ -415,21 +510,6 @@ export function App() {
         details={tooltip.details}
         type={tooltip.type}
       />
-
-      {/* Minimap */}
-      {ready && (
-        <Minimap
-          worldWidth={minimapData.worldWidth}
-          worldHeight={minimapData.worldHeight}
-          cameraX={minimapData.cameraX}
-          cameraY={minimapData.cameraY}
-          cameraZoom={minimapData.cameraZoom}
-          screenWidth={minimapData.screenWidth}
-          screenHeight={minimapData.screenHeight}
-          agents={minimapData.agents}
-          roadYFraction={minimapData.roadYFraction}
-        />
-      )}
 
       {/* Overlay dimmer — only for modals (project switcher), not side panels */}
       <div
@@ -467,16 +547,29 @@ export function App() {
         onClose={() => setProjectsOpen(false)}
         onSelectProject={() => {}}
         currentWeather={weather.state}
+        onProjectDetail={(project) => {
+          setProjectDetailProject(project);
+          setProjectDetailOpen(true);
+          setProjectsOpen(false);
+        }}
       />
-
-      {/* Token meter (power grid) */}
-      {ready && <TokenMeter />}
+      <ProjectDetailModal
+        open={projectDetailOpen}
+        onClose={() => { setProjectDetailOpen(false); setProjectDetailProject(null); }}
+        project={projectDetailProject}
+        onOpenProject={() => { setProjectDetailOpen(false); setProjectDetailProject(null); }}
+      />
 
       {/* Agent bar */}
       <AgentStatusBar
         stateRef={stateRef}
         subscribe={subscribe}
-        onSpawn={() => setSpawnOpen(true)}
+      />
+
+      {/* Power Grid modal */}
+      <PowerGridModal
+        open={powerGridOpen}
+        onClose={() => setPowerGridOpen(false)}
       />
 
       {/* Spawn modal */}
@@ -490,35 +583,3 @@ export function App() {
   );
 }
 
-/** Demo agents for first load */
-function addDemoAgents(renderer: CityRenderer) {
-  const demos: Array<{
-    id: string;
-    name: string;
-    status: CityAgent["status"];
-    cmd?: string;
-    file?: string;
-  }> = [
-    { id: "demo-1", name: "Claude 1", status: "writing", cmd: "Write", file: "button.tsx" },
-    { id: "demo-2", name: "Claude 2", status: "reading", cmd: "Read", file: "api.ts" },
-    { id: "demo-3", name: "Claude 3", status: "thinking" },
-    { id: "demo-4", name: "Claude 4", status: "stuck", cmd: "Bash", file: "helpers.ts" },
-    { id: "demo-5", name: "Claude 5", status: "idle" },
-  ];
-
-  demos.forEach((d, i) => {
-    const pos = renderer.getAgentPosition(d.status, i);
-    renderer.setAgent({
-      agentId: d.id,
-      displayName: d.name,
-      colorIndex: i,
-      status: d.status,
-      currentCommand: d.cmd,
-      toolInput: d.file,
-      x: pos.x,
-      y: pos.y,
-      targetX: pos.x,
-      targetY: pos.y,
-    });
-  });
-}

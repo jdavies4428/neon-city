@@ -5,6 +5,10 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    hmr: {
+      timeout: 5000,
+      overlay: true,
+    },
     proxy: {
       "/api": "http://localhost:5174",
       "/ws": {

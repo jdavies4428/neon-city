@@ -6,14 +6,19 @@ interface Props {
   onSetWeather?: (state: string) => void;
 }
 
+const WEATHER_DESCRIPTIONS: Record<string, string> = {
+  clear: "All quiet — no active agents",
+  sunny: "Bright and clear — manual override",
+  snow: "Light activity — agents warming up",
+  fog: "Deep idle — city resting",
+  aurora: "High productivity — agents in flow",
+  rain: "Blocked — an agent needs approval",
+  storm: "Multiple agents stuck — check alerts",
+};
+
 const WEATHER_OPTIONS: Array<{ id: string; icon: string; label: string; className: string }> = [
-  { id: "clear", icon: "✦", label: "Clear Night", className: "weather-clear" },
+  { id: "clear", icon: "🌙", label: "Clear Night", className: "weather-clear" },
   { id: "sunny", icon: "☀", label: "Sunny Day", className: "weather-sunny" },
-  { id: "rain", icon: "⛆", label: "Rain", className: "weather-rain" },
-  { id: "snow", icon: "❄", label: "Snow", className: "weather-snow" },
-  { id: "storm", icon: "⚡", label: "Storm", className: "weather-storm" },
-  { id: "fog", icon: "≋", label: "Fog", className: "weather-fog" },
-  { id: "aurora", icon: "◈", label: "Aurora", className: "weather-aurora" },
 ];
 
 export function WeatherIndicator({ weather, reason, onSetWeather }: Props) {
@@ -41,7 +46,7 @@ export function WeatherIndicator({ weather, reason, onSetWeather }: Props) {
     fetch("/api/weather/set", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ state: id === "sunny" ? "clear" : id, reason: "Manual override" }),
+      body: JSON.stringify({ state: id, reason: "Manual override" }),
     }).catch(() => {});
   };
 
@@ -54,6 +59,9 @@ export function WeatherIndicator({ weather, reason, onSetWeather }: Props) {
       >
         <span className="weather-icon">{current.icon}</span>
         <span className="weather-label">{current.label}</span>
+        <span style={{ fontSize: "9px", color: "var(--text-dim)", opacity: 0.7 }}>
+          {WEATHER_DESCRIPTIONS[current.id] ?? ""}
+        </span>
         <span className="weather-chevron">{menuOpen ? "▴" : "▾"}</span>
       </button>
 

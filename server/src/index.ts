@@ -1,12 +1,12 @@
 import express from "express";
 import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
-import { exec, execFile, execSync, spawn, type ChildProcess } from "child_process";
-import { readdir, readFile, stat, watch } from "fs/promises";
-import { join, basename, dirname } from "path";
+import { spawn, type ChildProcess } from "child_process";
+import { readdir, readFile, stat } from "fs/promises";
+import { join, basename, dirname, resolve, extname } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
-import { createReadStream, readFileSync, existsSync, statSync, readdirSync, mkdirSync } from "fs";
+import { createReadStream, existsSync, statSync, readdirSync, mkdirSync } from "fs";
 import { createInterface } from "readline";
 import { Indexer } from "./indexer/indexer.js";
 
@@ -30,6 +30,9 @@ interface AgentState {
   lastActivity: number;
   status: "idle" | "reading" | "writing" | "thinking" | "stuck" | "walking";
   waitingForApproval: boolean;
+  agentKind: "session" | "subagent";   // session = IDE/terminal, subagent = spawned
+  agentType?: string;                   // "frontend-developer", "debugger", etc.
+  spawnId?: string;                     // links back to spawn process
 }
 
 interface Notification {
@@ -80,12 +83,45 @@ function summarizeToolInput(toolName: string, input: any): string {
   }
 }
 
+function agentTypeFriendlyName(agentType: string): string {
+  const map: Record<string, string> = {
+    "frontend-developer": "Frontend Dev",
+    "backend-developer": "Backend Dev",
+    "mobile-developer": "Mobile Dev",
+    "mobile-app-developer": "Mobile App Dev",
+    "ui-designer": "UI Designer",
+    "database-administrator": "DBA",
+    "ai-engineer": "AI Engineer",
+    "security-engineer": "Security Eng",
+    "security-auditor": "Security Auditor",
+    "debugger": "Debugger",
+    "code-reviewer": "Code Reviewer",
+    "data-analyst": "Data Analyst",
+    "seo-specialist": "SEO Specialist",
+    "content-marketer": "Content Marketer",
+    "business-analyst": "Business Analyst",
+    "project-manager": "Project Manager",
+    "multi-agent-coordinator": "Coordinator",
+    "general-purpose": "General",
+    "Explore": "Explorer",
+    "Plan": "Planner",
+  };
+  return map[agentType] || agentType;
+}
+
 const agents = new Map<string, AgentState>();
 const clients = new Set<WebSocket>();
 const notifications: Notification[] = [];
 const chatHistory: ChatMessage[] = [];
 let notifCounter = 0;
 let chatCounter = 0;
+const sessionToSpawnId = new Map<string, string>(); // JSONL sessionId → spawnId
+// Subagent agent_ids that haven't been linked to a session_id yet (from PreToolUse).
+// When SubagentStart fires, we add the agent_id. When PreToolUse fires with an unknown
+// session_id, we adopt the oldest unlinked subagent instead of creating a duplicate.
+const unlinkedSubagents: string[] = [];
+// Per-agent debounced idle timers — keeps working status visible for minimum duration
+const agentIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 interface ToolActivity {
   id: string;
@@ -104,8 +140,71 @@ interface ToolActivity {
 const toolActivities = new Map<string, ToolActivity>();
 let toolActivityCounter = 0;
 
+// Tool classification sets (shared across hooks and legacy routes)
+const READ_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Search"]);
+const WRITE_TOOLS = new Set(["Write", "Edit", "Bash", "NotebookEdit"]);
+
 // ============================================================
-// Session Discovery — Lock Files + Terminal Scanning
+// Shared helpers for hooks and routes
+// ============================================================
+
+/** Clear a pending idle timer for an agent */
+function clearIdleTimer(agentId: string) {
+  clearTimeout(agentIdleTimers.get(agentId));
+  agentIdleTimers.delete(agentId);
+}
+
+/** Schedule a debounced idle transition (2s) after a tool completes */
+function scheduleDebouncedIdle(agentId: string) {
+  const agent = agents.get(agentId);
+  if (!agent) return;
+  agent.lastActivity = Date.now();
+  const completedTool = agent.currentCommand;
+  clearIdleTimer(agentId);
+  agentIdleTimers.set(agentId, setTimeout(() => {
+    agentIdleTimers.delete(agentId);
+    const a = agents.get(agentId);
+    if (a && (a.currentCommand === completedTool || !a.currentCommand)) {
+      a.currentCommand = undefined;
+      a.toolInput = undefined;
+      a.status = "idle";
+      a.lastActivity = Date.now();
+      broadcastThrottled("activity", { agent: a });
+    }
+  }, 2000));
+}
+
+/** Push a notification, cap at 200, and broadcast */
+function pushNotification(
+  fields: Omit<Notification, "id" | "timestamp" | "resolved">,
+  broadcastExtras?: Record<string, unknown>
+): Notification {
+  const notif: Notification = {
+    ...fields,
+    id: `notif-${++notifCounter}`,
+    timestamp: Date.now(),
+    resolved: false,
+  };
+  notifications.push(notif);
+  if (notifications.length > 200) notifications.splice(0, notifications.length - 200);
+  broadcast("notification", broadcastExtras ? { ...notif, ...broadcastExtras } : notif);
+  return notif;
+}
+
+/** Push a chat message, cap at 500, and broadcast */
+function pushChatMessage(msg: ChatMessage) {
+  chatHistory.push(msg);
+  if (chatHistory.length > 500) chatHistory.splice(0, chatHistory.length - 500);
+  broadcast("chat-message", msg);
+}
+
+/** Resolve an agent's display name with fallback */
+function agentDisplayName(agentId: string | undefined, fallback = "Claude"): string {
+  return agents.get(agentId || "")?.displayName || fallback;
+}
+
+// ============================================================
+// Session Discovery
 // ============================================================
 
 interface DiscoveredSession {
@@ -121,226 +220,35 @@ interface DiscoveredSession {
 
 const discoveredSessions = new Map<string, DiscoveredSession>();
 
-/** Scan ~/.claude/ide/*.lock to discover running IDE sessions */
-function scanLockFiles() {
-  const lockDir = join(homedir(), ".claude", "ide");
-  if (!existsSync(lockDir)) return;
-
-  const currentLockPids = new Set<number>();
-
-  try {
-    const lockFiles = readdirSync(lockDir).filter((f) => f.endsWith(".lock"));
-
-    for (const lockFile of lockFiles) {
-      try {
-        const content = readFileSync(join(lockDir, lockFile), "utf-8");
-        const lock = JSON.parse(content) as {
-          pid: number;
-          workspaceFolders: string[];
-          ideName: string;
-          transport: string;
-        };
-
-        // Verify PID is alive
-        try {
-          process.kill(lock.pid, 0);
-        } catch {
-          // PID dead — skip
-          continue;
-        }
-
-        currentLockPids.add(lock.pid);
-
-        // For each workspace folder, find the matching project dir + active session
-        for (const workspace of lock.workspaceFolders) {
-          const claudeProjects = join(homedir(), ".claude", "projects");
-          if (!existsSync(claudeProjects)) continue;
-
-          // Encode workspace path the way Claude does: /Users/jeff/proj → -Users-jeff-proj
-          // Claude encodes project paths: / → -, space → -, and other special chars → -
-          const encodedPath = workspace.replace(/[\/ ]/g, "-");
-          const projectDir = join(claudeProjects, encodedPath);
-          if (!existsSync(projectDir)) continue;
-
-          // Find most recently modified JSONL file = active session
-          const jsonlFiles = readdirSync(projectDir)
-            .filter((f) => f.endsWith(".jsonl"))
-            .map((f) => ({
-              name: f,
-              sessionId: f.replace(".jsonl", ""),
-              mtime: statSync(join(projectDir, f)).mtimeMs,
-            }))
-            .sort((a, b) => b.mtime - a.mtime);
-
-          if (jsonlFiles.length === 0) continue;
-
-          const activeSession = jsonlFiles[0];
-          const key = `lock-${lock.pid}-${workspace}`;
-
-          // Skip if already discovered with same session
-          const existing = discoveredSessions.get(key);
-          if (existing && existing.sessionId === activeSession.sessionId) {
-            existing.lastActivity = activeSession.mtime;
-            continue;
-          }
-
-          const projName = friendlyProjectName(workspace);
-          const title = getSessionTitle(activeSession.sessionId);
-
-          discoveredSessions.set(key, {
-            sessionId: activeSession.sessionId,
-            pid: lock.pid,
-            workspaceFolders: lock.workspaceFolders,
-            ideName: lock.ideName,
-            projectName: projName,
-            projectPath: workspace,
-            title,
-            lastActivity: activeSession.mtime,
-          });
-
-          // Auto-start chat watcher for this session
-          const label = title
-            ? `${lock.ideName}/${projName}: ${title}`
-            : `${lock.ideName} — ${projName}`;
-          watchChatSession(activeSession.sessionId, label, `Claude (${lock.ideName})`);
-
-          // Also start voice/TTS watcher for this session
-          const sessionFilePath = join(projectDir, `${activeSession.sessionId}.jsonl`);
-          watchSessionFile(sessionFilePath, activeSession.sessionId);
-
-          console.log(`[lock-scan] Discovered ${lock.ideName} session: ${activeSession.sessionId.slice(0, 8)}... (${projName})`);
-        }
-      } catch {
-        // Skip bad lock files
-      }
-    }
-  } catch {
-    // Lock dir read failed
-  }
-
-  // Remove stale entries (PID no longer alive)
-  for (const [key, session] of discoveredSessions) {
-    if (key.startsWith("lock-")) {
-      try {
-        process.kill(session.pid, 0);
-      } catch {
-        console.log(`[lock-scan] Session gone: ${session.ideName} — ${session.projectName}`);
-        discoveredSessions.delete(key);
-      }
-    }
-  }
-}
-
-/** Scan for terminal claude sessions via ps aux */
-function scanTerminalSessions() {
-  exec("ps aux", (err, stdout) => {
-    if (err || !stdout) return;
-
-    const lines = stdout.split("\n");
-    const terminalPids = new Set<number>();
-
-    for (const line of lines) {
-      // Match claude processes — both with and without --resume
-      // Skip IDE-managed processes (they have --output-format stream-json)
-      if (!line.match(/\bclaude\b/) || line.includes("--output-format")) continue;
-      // Skip non-process lines (e.g. Claude.app, grep, etc.)
-      if (line.includes("Claude.app") || line.includes("grep")) continue;
-
-      const cols = line.trim().split(/\s+/);
-      const pid = parseInt(cols[1]);
-      if (isNaN(pid)) continue;
-
-      // Check for --resume <session-id>
-      const resumeMatch = line.match(/--resume\s+([0-9a-f-]{36})/);
-      let sessionId = resumeMatch ? resumeMatch[1] : null;
-
-      // If no --resume, find session by PID's working directory
-      if (!sessionId) {
-        try {
-          // Use lsof to get the process cwd
-          const cwdOut = execSync(
-            `lsof -d cwd -a -p ${pid} -Fn 2>/dev/null`, { encoding: "utf-8", timeout: 3000 }
-          );
-          const cwdMatch = cwdOut.match(/\nn(.+)/);
-          if (cwdMatch) {
-            const cwd = cwdMatch[1];
-            const encoded = cwd.replace(/[\/ ]/g, "-");
-            const projDir = join(homedir(), ".claude", "projects", encoded);
-            if (existsSync(projDir)) {
-              // Collect session IDs already claimed by IDE (lock-file) sessions
-              const ideSessionIds = new Set<string>();
-              for (const [k, s] of discoveredSessions) {
-                if (k.startsWith("lock-")) ideSessionIds.add(s.sessionId);
-              }
-
-              const jsonls = readdirSync(projDir)
-                .filter((f) => f.endsWith(".jsonl"))
-                .map((f) => ({ id: f.replace(".jsonl", ""), mtime: statSync(join(projDir, f)).mtimeMs }))
-                .sort((a, b) => b.mtime - a.mtime);
-              // Pick the most recent JSONL that is NOT already claimed by an IDE session
-              const match = jsonls.find((j) => !ideSessionIds.has(j.id));
-              if (match) sessionId = match.id;
-            }
-          }
-        } catch {
-          // lsof failed, skip
-        }
-      }
-
-      if (!sessionId) continue;
-
-      terminalPids.add(pid);
-      const key = `term-${pid}`;
-
-      if (discoveredSessions.has(key)) {
-        discoveredSessions.get(key)!.lastActivity = Date.now();
-        continue;
-      }
-
-      const project = findSessionProject(sessionId);
-      const projName = project?.projectName || "Terminal";
-      const title = getSessionTitle(sessionId);
-
-      discoveredSessions.set(key, {
-        sessionId,
-        pid,
-        workspaceFolders: project ? [project.projectPath] : [],
-        ideName: "Terminal",
-        projectName: projName,
-        projectPath: project?.projectPath || "",
-        title,
-        lastActivity: Date.now(),
-      });
-
-      const label = title ? `Terminal/${projName}: ${title}` : `Terminal — ${projName}`;
-      watchChatSession(sessionId, label, "Claude (Terminal)");
-
-      // Also start voice/TTS watcher for this session
-      maybeWatchAgent(sessionId);
-
-      console.log(`[term-scan] Discovered terminal session: ${sessionId.slice(0, 8)}... (${projName})`);
-    }
-
-    // Remove stale terminal entries
-    for (const [key, session] of discoveredSessions) {
-      if (key.startsWith("term-") && !terminalPids.has(session.pid)) {
-        try {
-          process.kill(session.pid, 0);
-        } catch {
-          console.log(`[term-scan] Terminal session gone: ${session.projectName}`);
-          discoveredSessions.delete(key);
-        }
-      }
-    }
-  });
-}
-
 // ============================================================
 // WebSocket
 // ============================================================
 
 wss.on("connection", (ws) => {
   clients.add(ws);
+
+  // Compute stats eagerly so the client never has to wait for the 10-second
+  // broadcast interval to see token usage and session counts.
+  let initStats: Record<string, unknown> = {};
+  try {
+    const basic = indexer.getStats();
+    const tokens = indexer.getTokenStats();
+    initStats = {
+      activeAgents: agents.size,
+      totalProjects: basic.projects,
+      totalSessions: basic.sessions,
+      totalMessages: basic.messages,
+      totalTokens: tokens.totalTokens,
+      inputTokens: tokens.inputTokens,
+      outputTokens: tokens.outputTokens,
+      estimatedCost: tokens.estimatedCost,
+      tokens24h: tokens.tokens24h,
+      activeSessions: tokens.activeSessions,
+    };
+  } catch {
+    // Non-fatal — client will get stats on the next periodic broadcast
+  }
+
   ws.send(
     JSON.stringify({
       type: "init",
@@ -352,6 +260,7 @@ wss.on("connection", (ws) => {
         toolActivities: Array.from(toolActivities.values())
           .filter((a) => Date.now() - a.startedAt < 300_000)
           .slice(-30),
+        stats: initStats,
       },
     })
   );
@@ -379,14 +288,15 @@ function broadcastThrottled(type: string, data: unknown) {
 
   if (!broadcastTimer) {
     broadcastTimer = setInterval(() => {
+      if (pendingBroadcasts.size === 0) {
+        clearInterval(broadcastTimer!);
+        broadcastTimer = null;
+        return;
+      }
       for (const [t, d] of pendingBroadcasts) {
         broadcast(t, d);
       }
       pendingBroadcasts.clear();
-      if (pendingBroadcasts.size === 0) {
-        clearInterval(broadcastTimer!);
-        broadcastTimer = null;
-      }
     }, 66); // ~15fps
   }
 }
@@ -401,7 +311,7 @@ function getOrCreateAgent(
 ): AgentState | null {
   let agent = agents.get(agentId);
   if (!agent) {
-    if (agents.size >= 10) return null;
+    if (agents.size >= 30) return null;
 
     // Count existing agents of this source type for numbering
     let num = 1;
@@ -417,12 +327,22 @@ function getOrCreateAgent(
       lastActivity: Date.now(),
       status: "idle",
       waitingForApproval: false,
+      agentKind: "session",
     };
     agents.set(agentId, agent);
     // Try to watch this agent's session file for voice
-    maybeWatchAgent(agentId);
+    maybeWatchAgent(agentId).catch(() => {});
   }
   return agent;
+}
+
+function findAgentBySessionId(sessionId: string): string | undefined {
+  if (agents.has(sessionId)) return sessionId;
+  const prefixed = `session-${sessionId}`;
+  if (agents.has(prefixed)) return prefixed;
+  const mapped = sessionToSpawnId.get(sessionId);
+  if (mapped && agents.has(mapped)) return mapped;
+  return undefined;
 }
 
 // ============================================================
@@ -496,7 +416,12 @@ app.post("/api/notification", (req, res) => {
   const { type, agentId, toolName, description } = req.body;
   if (!agentId) return res.status(400).json({ error: "agentId required" });
 
-  const agent = agents.get(agentId);
+  let agent = agents.get(agentId);
+  // If this agentId is a session ID that maps to a spawned agent, use that
+  if (!agent) {
+    const mappedSpawnId = sessionToSpawnId.get(agentId);
+    if (mappedSpawnId) agent = agents.get(mappedSpawnId);
+  }
   const agentName = agent?.displayName || "Unknown Agent";
 
   // Mark agent as waiting
@@ -505,24 +430,13 @@ app.post("/api/notification", (req, res) => {
     agent.status = "stuck";
   }
 
-  const notif: Notification = {
-    id: `notif-${++notifCounter}`,
+  const notif = pushNotification({
     type: type || "info",
     agentId,
     agentName,
     toolName,
     description: description || "",
-    timestamp: Date.now(),
-    resolved: false,
-  };
-
-  notifications.push(notif);
-  // Keep last 200
-  if (notifications.length > 200) {
-    notifications.splice(0, notifications.length - 200);
-  }
-
-  broadcast("notification", notif);
+  });
   res.json({ ok: true, id: notif.id });
 });
 
@@ -564,6 +478,7 @@ interface ApprovalRequest {
 }
 
 const approvalRequests = new Map<string, ApprovalRequest>();
+const approvalResolvers = new Map<string, (decision: string, updatedInput?: any) => void>();
 const autoApproveTools = new Set<string>();
 let approvalCounter = 0;
 
@@ -578,7 +493,12 @@ app.post("/api/approval/request", (req, res) => {
     return res.json({ id: `auto-${Date.now()}`, decision: "approve" });
   }
 
-  const agent = agents.get(agentId);
+  let agent = agents.get(agentId);
+  // If this agentId is a session ID that maps to a spawned agent, use that
+  if (!agent) {
+    const mappedSpawnId = sessionToSpawnId.get(agentId);
+    if (mappedSpawnId) agent = agents.get(mappedSpawnId);
+  }
   const agentName = agent?.displayName || "Unknown Agent";
 
   if (agent) {
@@ -599,38 +519,48 @@ app.post("/api/approval/request", (req, res) => {
   approvalRequests.set(id, request);
 
   // Create notification so it shows in Alerts tab
-  const notif: Notification = {
-    id: `notif-for-${id}`,
+  pushNotification({
     type: "approval-needed",
     agentId,
     agentName,
     toolName,
     description: description || `${toolName}: ${(toolInput || "").slice(0, 100)}`,
-    timestamp: Date.now(),
-    resolved: false,
-  };
-  notifications.push(notif);
-  if (notifications.length > 200) notifications.splice(0, notifications.length - 200);
-  broadcast("notification", { ...notif, approvalId: id });
+  }, { approvalId: id });
 
   res.json({ id, status: "pending" });
 });
 
 app.post("/api/approval/:id/decide", (req, res) => {
+  const { id } = req.params;
+  const { decision } = req.body;
+
+  // Check if this is a hooks-based approval (PermissionRequest hook)
+  const resolver = approvalResolvers.get(id);
+  if (resolver) {
+    resolver(decision, req.body.updatedInput);
+    res.json({ ok: true, id, decision });
+    return;
+  }
+
   const request = approvalRequests.get(req.params.id);
   if (!request) return res.status(404).json({ error: "not found" });
   if (request.status !== "pending") {
     return res.json({ id: request.id, status: request.status });
   }
 
-  const { decision, approveAll } = req.body;
+  const { approveAll } = req.body;
   request.status = decision === "approve" ? "approved" : "denied";
 
   if (approveAll && decision === "approve") {
     autoApproveTools.add(request.toolName);
   }
 
-  const agent = agents.get(request.agentId);
+  let agent = agents.get(request.agentId);
+  // If this agentId is a session ID that maps to a spawned agent, use that
+  if (!agent) {
+    const mappedSpawnId = sessionToSpawnId.get(request.agentId);
+    if (mappedSpawnId) agent = agents.get(mappedSpawnId);
+  }
   if (agent) {
     agent.waitingForApproval = false;
     agent.status = "idle";
@@ -679,43 +609,346 @@ app.get("/api/approval/:id/wait", (req, res) => {
 });
 
 // ============================================================
+// Routes — Claude Code Hooks (native event-driven integration)
+// ============================================================
+
+// Hook 1: Session Start
+app.post("/api/hooks/session-start", (req, res) => {
+  const { session_id, cwd } = req.body;
+  const projectName = friendlyProjectName(cwd || "unknown");
+  const agentId = `session-${session_id}`;
+
+  // Idempotent: update if exists
+  const existing = agents.get(agentId);
+  if (existing) {
+    existing.lastActivity = Date.now();
+    broadcast("activity", { agent: existing });
+    res.json({});
+    return;
+  }
+
+  discoveredSessions.set(`hook-${session_id}`, {
+    sessionId: session_id,
+    pid: 0,
+    workspaceFolders: [cwd || ""],
+    ideName: "Claude Code",
+    projectName,
+    projectPath: cwd || "",
+    title: null,
+    lastActivity: Date.now(),
+  });
+
+  const newAgent: AgentState = {
+    agentId,
+    displayName: projectName,
+    source: "claude",
+    isThinking: false,
+    lastActivity: Date.now(),
+    status: "idle",
+    waitingForApproval: false,
+    agentKind: "session",
+  };
+  agents.set(agentId, newAgent);
+
+  broadcast("activity", { agent: newAgent });
+  res.json({});
+});
+
+// Hook 2: Session End
+app.post("/api/hooks/session-end", (req, res) => {
+  const { session_id } = req.body;
+  const agentId = findAgentBySessionId(session_id) || `session-${session_id}`;
+
+  agents.delete(agentId);
+  discoveredSessions.delete(`hook-${session_id}`);
+  clearIdleTimer(agentId);
+
+  // Stop any JSONL watcher for this session
+  const watcher = chatWatchers.get(session_id);
+  if (watcher) {
+    clearInterval(watcher);
+    chatWatchers.delete(session_id);
+  }
+
+  broadcast("agent-removed", { agentId });
+  res.json({});
+});
+
+// Hook 3: Pre Tool Use
+app.post("/api/hooks/pre-tool-use", (req, res) => {
+  const { session_id, tool_name, tool_input, tool_use_id, cwd } = req.body;
+  let agentId = findAgentBySessionId(session_id);
+
+  // Auto-create agent if not found (hook may fire before session-start)
+  if (!agentId) {
+    // Check if this is a subagent whose session_id we haven't seen yet.
+    // Adopt the oldest unlinked subagent instead of creating a duplicate.
+    const unlinkedId = unlinkedSubagents.length > 0 ? unlinkedSubagents.shift()! : null;
+    if (unlinkedId && agents.has(unlinkedId)) {
+      agentId = unlinkedId;
+      // Map this session_id → subagent so future hooks find it
+      sessionToSpawnId.set(session_id, unlinkedId);
+    } else {
+      agentId = `session-${session_id}`;
+      const projectName = cwd ? friendlyProjectName(cwd) : "Claude";
+      agents.set(agentId, {
+        agentId,
+        displayName: projectName,
+        source: "claude",
+        isThinking: false,
+        lastActivity: Date.now(),
+        status: "idle",
+        waitingForApproval: false,
+        agentKind: "session",
+      });
+    }
+  }
+
+  const agent = agents.get(agentId);
+  if (!agent) { res.json({}); return; }
+
+  // Cancel pending idle timer
+  clearIdleTimer(agentId);
+
+  // Map tool to status
+  if (READ_TOOLS.has(tool_name)) {
+    agent.status = "reading";
+  } else if (WRITE_TOOLS.has(tool_name)) {
+    agent.status = "writing";
+  } else {
+    agent.status = "thinking";
+  }
+
+  agent.currentCommand = tool_name;
+  agent.toolInput = summarizeToolInput(tool_name, tool_input || {});
+  agent.lastActivity = Date.now();
+  agent.isThinking = false;
+
+  // Track tool activity
+  const activityId = `tool-${++toolActivityCounter}`;
+  toolActivities.set(tool_use_id, {
+    id: activityId,
+    toolUseId: tool_use_id,
+    agentId,
+    agentName: agent.displayName,
+    sessionId: session_id,
+    toolName: tool_name,
+    toolInput: agent.toolInput || tool_name,
+    status: "running",
+    startedAt: Date.now(),
+  });
+  if (toolActivities.size > 200) {
+    // Prefer evicting completed/errored entries over running ones
+    let evictKey: string | undefined;
+    for (const [key, act] of toolActivities) {
+      if (act.status !== "running") { evictKey = key; break; }
+    }
+    if (!evictKey) evictKey = toolActivities.keys().next().value;
+    if (evictKey) toolActivities.delete(evictKey);
+  }
+
+  // Immediate broadcast (not throttled) — tool-start is high-signal
+  broadcast("activity", { agent });
+  broadcast("tool-activity", toolActivities.get(tool_use_id));
+  res.json({});
+});
+
+// Hook 4: Post Tool Use
+app.post("/api/hooks/post-tool-use", (req, res) => {
+  const { session_id, tool_use_id } = req.body;
+  const agentId = findAgentBySessionId(session_id);
+
+  // Update tool activity
+  const activity = toolActivities.get(tool_use_id);
+  if (activity) {
+    activity.status = "complete";
+    activity.completedAt = Date.now();
+    broadcast("tool-activity", activity);
+  }
+
+  // Debounced idle transition (2s)
+  if (agentId) scheduleDebouncedIdle(agentId);
+
+  res.json({});
+});
+
+// Hook 5: Post Tool Use Failure
+app.post("/api/hooks/post-tool-use-failure", (req, res) => {
+  const { session_id, tool_name, tool_use_id, error } = req.body;
+  const agentId = findAgentBySessionId(session_id);
+  // Update tool activity
+  const activity = toolActivities.get(tool_use_id);
+  if (activity) {
+    activity.status = "error";
+    activity.error = typeof error === "string" ? error : JSON.stringify(error);
+    activity.completedAt = Date.now();
+    broadcast("tool-activity", activity);
+  }
+
+  // Create error notification
+  pushNotification({
+    type: "error",
+    agentId: agentId || session_id,
+    agentName: agentDisplayName(agentId),
+    toolName: tool_name,
+    description: `${tool_name} failed: ${(typeof error === "string" ? error : "Unknown error").slice(0, 200)}`,
+  });
+
+  // Debounced idle transition (same as post-tool-use)
+  if (agentId) scheduleDebouncedIdle(agentId);
+
+  res.json({});
+});
+
+// Hook 6: PermissionRequest intentionally excluded from setup.js — it blocks tool
+// execution until the Neon City UI approves, which deadlocks if the UI is unavailable.
+// The endpoint is removed to avoid dead code. Re-add if an opt-in mechanism is built.
+
+// Hook 7: Subagent Start
+app.post("/api/hooks/subagent-start", (req, res) => {
+  const { session_id: _session_id, agent_id, agent_type } = req.body;
+  const displayName = agentTypeFriendlyName(agent_type || "General");
+  const agentId = agent_id || `subagent-${Date.now()}`;
+
+  const newAgent: AgentState = {
+    agentId,
+    displayName,
+    source: "claude",
+    isThinking: false,
+    lastActivity: Date.now(),
+    status: "walking",
+    waitingForApproval: false,
+    agentKind: "subagent",
+    agentType: agent_type,
+  };
+  agents.set(agentId, newAgent);
+
+  // Track as unlinked — will be adopted when PreToolUse fires with its session_id
+  unlinkedSubagents.push(agentId);
+
+  broadcast("activity", { agent: newAgent });
+  res.json({});
+});
+
+// Hook 8: Subagent Stop
+app.post("/api/hooks/subagent-stop", (req, res) => {
+  const { agent_id, agent_type, last_assistant_message } = req.body;
+  const agentId = agent_id;
+  const agentName = agents.get(agentId)?.displayName || agentTypeFriendlyName(agent_type || "Agent");
+
+  // Create completion notification
+  pushNotification({
+    type: "task-complete",
+    agentId: agentId || "unknown",
+    agentName,
+    description: (typeof last_assistant_message === "string" ? last_assistant_message : "")?.slice(0, 200) || "Agent completed its task",
+  });
+
+  // Remove agent and clean up mappings
+  agents.delete(agentId);
+  clearIdleTimer(agentId);
+  const unlinkedIdx = unlinkedSubagents.indexOf(agentId);
+  if (unlinkedIdx !== -1) unlinkedSubagents.splice(unlinkedIdx, 1);
+  // Clean up sessionToSpawnId reverse mapping
+  for (const [sid, aid] of sessionToSpawnId) {
+    if (aid === agentId) { sessionToSpawnId.delete(sid); break; }
+  }
+  broadcast("agent-removed", { agentId });
+
+  res.json({});
+});
+
+// Hook 9: Stop (Claude finished responding)
+app.post("/api/hooks/stop", (req, res) => {
+  const { session_id, last_assistant_message } = req.body;
+  const agentId = findAgentBySessionId(session_id);
+
+  const agent = agentId ? agents.get(agentId) : undefined;
+  if (agent) {
+    agent.status = "idle";
+    agent.currentCommand = undefined;
+    agent.toolInput = undefined;
+    agent.isThinking = false;
+    agent.lastActivity = Date.now();
+  }
+  if (agentId) clearIdleTimer(agentId);
+
+  // Add assistant's final message to chat
+  if (last_assistant_message && typeof last_assistant_message === "string") {
+    pushChatMessage({
+      id: `msg-${++chatCounter}`,
+      role: "assistant",
+      content: last_assistant_message,
+      agentName: agentDisplayName(agentId),
+      sessionId: session_id,
+      timestamp: Date.now(),
+    });
+  }
+
+  broadcast("activity", { agent: agent || { agentId: agentId || session_id, status: "idle" } });
+  res.json({});
+});
+
+// Hook 10: User Prompt Submit
+app.post("/api/hooks/user-prompt-submit", (req, res) => {
+  const { session_id, prompt } = req.body;
+  const agentId = findAgentBySessionId(session_id);
+  const agent = agentId ? agents.get(agentId) : undefined;
+
+  if (agent) {
+    agent.status = "thinking";
+    agent.isThinking = true;
+    agent.lastActivity = Date.now();
+    broadcast("activity", { agent });
+  }
+
+  // Add to chat history (with dedup check — scan from end since dupes are recent)
+  if (prompt && typeof prompt === "string") {
+    let isDupe = false;
+    for (let i = chatHistory.length - 1; i >= 0; i--) {
+      const m = chatHistory[i];
+      if (Date.now() - m.timestamp >= 5000) break;
+      if (m.role === "user" && m.content === prompt && m.sessionId === session_id) {
+        isDupe = true;
+        break;
+      }
+    }
+    if (!isDupe) {
+      pushChatMessage({
+        id: `msg-${++chatCounter}`,
+        role: "user",
+        content: prompt,
+        sessionId: session_id,
+        sessionLabel: agent?.displayName || "Claude",
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  res.json({});
+});
+
+// Hook 11: Notification
+app.post("/api/hooks/notification", (req, res) => {
+  const { session_id, message, title, notification_type } = req.body;
+  const agentId = findAgentBySessionId(session_id);
+
+  pushNotification({
+    type: notification_type === "permission_prompt" ? "approval-needed" : "info",
+    agentId: agentId || session_id,
+    agentName: agentDisplayName(agentId),
+    description: message || title || "System notification",
+  });
+
+  res.json({});
+});
+
+// ============================================================
 // Routes — Chat / Messaging
 // ============================================================
 
 /** Extract first user message from a session JSONL to use as title */
-function getSessionTitle(sessionId: string): string | null {
-  const claudeProjects = join(homedir(), ".claude", "projects");
-  if (!existsSync(claudeProjects)) return null;
-
-  try {
-    const projectDirs = readdirSync(claudeProjects);
-    for (const dir of projectDirs) {
-      const filePath = join(claudeProjects, dir, `${sessionId}.jsonl`);
-      if (!existsSync(filePath)) continue;
-
-      // Read first few lines to find first user message
-      const data = readFileSync(filePath, "utf-8");
-      for (const line of data.split("\n").slice(0, 20)) {
-        if (!line.trim()) continue;
-        try {
-          const entry = JSON.parse(line);
-          // User messages have type "user" with message.role "user"
-          if ((entry.type === "user" || (entry.type === "message" && entry.message?.role === "user"))
-              && entry.message?.content) {
-            let text = "";
-            const content = entry.message.content;
-            if (typeof content === "string") text = content;
-            else if (Array.isArray(content)) {
-              text = content.filter((b: any) => b.type === "text").map((b: any) => b.text).join(" ");
-            }
-            if (text) return text.slice(0, 60) + (text.length > 60 ? "..." : "");
-          }
-        } catch { /* skip */ }
-      }
-    }
-  } catch { /* ignore */ }
-  return null;
-}
+// getSessionTitle removed — replaced by indexer.getSessionTitle() (fast SQLite lookup)
 
 // Persistent chat session for Neon City chat panel (reuses same session across messages)
 let neonChatSessionId: string | null = null;
@@ -756,8 +989,7 @@ app.post("/api/chat/send", async (req, res) => {
     sessionLabel,
     timestamp: Date.now(),
   };
-  chatHistory.push(userMsg);
-  broadcast("chat-message", userMsg);
+  pushChatMessage(userMsg);
 
   // Build args — use --resume to continue existing session, -p for print mode
   const args: string[] = [];
@@ -799,7 +1031,7 @@ app.post("/api/chat/send", async (req, res) => {
       const content = stdout.trim() || stderr.trim() || `(exited with code ${code})`;
       // Only broadcast stdout response if we DON'T have a chat watcher picking it up
       if (!targetSessionId || !chatWatchers.has(targetSessionId)) {
-        const assistantMsg: ChatMessage = {
+        pushChatMessage({
           id: `msg-${++chatCounter}`,
           role: "assistant",
           content,
@@ -807,21 +1039,14 @@ app.post("/api/chat/send", async (req, res) => {
           sessionId: targetSessionId || "neon-chat",
           sessionLabel,
           timestamp: Date.now(),
-        };
-        chatHistory.push(assistantMsg);
-        broadcast("chat-message", assistantMsg);
+        });
       }
     });
-
-    // If session-based, also start the JSONL watcher
-    if (targetSessionId) {
-      watchChatSession(targetSessionId, sessionLabel, agent?.displayName || "Claude");
-    }
 
     // Give it 2 seconds to fail fast (voice-mode pattern)
     setTimeout(() => {
       if (child.exitCode !== null && child.exitCode !== 0) {
-        const errMsg: ChatMessage = {
+        pushChatMessage({
           id: `msg-${++chatCounter}`,
           role: "assistant",
           content: `(Error: ${stderr.trim() || "claude exited with code " + child.exitCode})`,
@@ -829,9 +1054,7 @@ app.post("/api/chat/send", async (req, res) => {
           sessionId: targetSessionId || "neon-chat",
           sessionLabel,
           timestamp: Date.now(),
-        };
-        chatHistory.push(errMsg);
-        broadcast("chat-message", errMsg);
+        });
       }
     }, 2000);
 
@@ -908,10 +1131,25 @@ function friendlyProjectName(fullPath: string): string {
   return meaningful.slice(-2).join("/");
 }
 
-/** Find which project a session file belongs to (returns project name or null) */
+/** Find which project a session file belongs to (returns project name or null).
+ *  Results are cached to avoid repeated sync filesystem scans. */
+const sessionProjectCache = new Map<string, { projectName: string; projectPath: string } | null>();
+let sessionProjectCacheTime = 0;
+
 function findSessionProject(sessionId: string): { projectName: string; projectPath: string } | null {
+  // Rebuild cache every 30s
+  const now = Date.now();
+  if (now - sessionProjectCacheTime > 30_000) {
+    sessionProjectCache.clear();
+    sessionProjectCacheTime = now;
+  }
+
+  if (sessionProjectCache.has(sessionId)) {
+    return sessionProjectCache.get(sessionId)!;
+  }
+
   const claudeProjects = join(homedir(), ".claude", "projects");
-  if (!existsSync(claudeProjects)) return null;
+  if (!existsSync(claudeProjects)) { sessionProjectCache.set(sessionId, null); return null; }
 
   try {
     const projectDirs = readdirSync(claudeProjects);
@@ -919,12 +1157,15 @@ function findSessionProject(sessionId: string): { projectName: string; projectPa
       const sessionFile = join(claudeProjects, dir, `${sessionId}.jsonl`);
       if (existsSync(sessionFile)) {
         const decoded = decodeProjectDir(dir);
-        return { projectName: friendlyProjectName(decoded), projectPath: decoded };
+        const result = { projectName: friendlyProjectName(decoded), projectPath: decoded };
+        sessionProjectCache.set(sessionId, result);
+        return result;
       }
     }
   } catch {
     // Ignore
   }
+  sessionProjectCache.set(sessionId, null);
   return null;
 }
 
@@ -953,6 +1194,77 @@ function getSessionColor(sessionId: string): string {
  * Active sessions = hook-registered agents (live) + recent session files (last 24h).
  * Each session gets a label like "Claude 1 — myproject" and a color.
  */
+
+// Cache for expensive recent-session filesystem scan (statSync per .jsonl file)
+let recentSessionsCache: Array<{
+  sessionId: string; label: string; agentName: string; projectName: string;
+  projectPath: string; status: string; lastActivity: number; color: string;
+  isLive: boolean; ideName: string;
+}> = [];
+let recentSessionsCacheTime = 0;
+const RECENT_SESSIONS_CACHE_TTL = 10_000; // 10s
+
+async function getRecentSessions(seenSessionIds: Set<string>) {
+  const now = Date.now();
+  if (now - recentSessionsCacheTime < RECENT_SESSIONS_CACHE_TTL && recentSessionsCache.length > 0) {
+    return recentSessionsCache.filter(s => !seenSessionIds.has(s.sessionId));
+  }
+
+  const results: typeof recentSessionsCache = [];
+  const claudeProjects = join(homedir(), ".claude", "projects");
+  try { await stat(claudeProjects); } catch { recentSessionsCache = []; recentSessionsCacheTime = now; return []; }
+
+  const cutoff = now - 24 * 60 * 60 * 1000;
+  const projectDirs = await readdir(claudeProjects);
+
+  for (const dir of projectDirs.slice(0, 20)) {
+    const projectPath = join(claudeProjects, dir);
+    try {
+      const st = await stat(projectPath);
+      if (!st.isDirectory()) continue;
+
+      const dirFiles = await readdir(projectPath);
+      const jsonlNames = dirFiles.filter((f) => f.endsWith(".jsonl"));
+      const files: Array<{ name: string; sessionId: string; mtime: number }> = [];
+      for (const f of jsonlNames) {
+        try {
+          const fst = await stat(join(projectPath, f));
+          if (fst.mtimeMs > cutoff) {
+            files.push({ name: f, sessionId: f.replace(".jsonl", ""), mtime: fst.mtimeMs });
+          }
+        } catch { /* skip */ }
+      }
+      files.sort((a, b) => b.mtime - a.mtime);
+      const top5 = files.slice(0, 5);
+
+      const decoded = decodeProjectDir(dir);
+      const projName = friendlyProjectName(decoded);
+
+      for (const f of top5) {
+        const title = indexer.getSessionTitle(f.sessionId);
+        results.push({
+          sessionId: f.sessionId,
+          label: title ? `${projName}: ${title}` : `Session — ${projName}`,
+          agentName: "Claude",
+          projectName: projName,
+          projectPath: decoded,
+          status: "idle",
+          lastActivity: f.mtime,
+          color: getSessionColor(f.sessionId),
+          isLive: false,
+          ideName: "Recent",
+        });
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  recentSessionsCache = results;
+  recentSessionsCacheTime = now;
+  return results.filter(s => !seenSessionIds.has(s.sessionId));
+}
+
 app.get("/api/sessions/active", async (_req, res) => {
   try {
     const activeSessions: Array<{
@@ -996,6 +1308,8 @@ app.get("/api/sessions/active", async (_req, res) => {
     // 2. Hook-registered agents (confirmed live, but may overlap with lock files)
     for (const [id, agent] of agents) {
       if (seenSessionIds.has(id)) continue;
+      // Skip citizen placeholder agents — they're city decoration, not real sessions
+      if (id.startsWith("citizen-")) continue;
       seenSessionIds.add(id);
 
       const project = findSessionProject(id);
@@ -1016,52 +1330,11 @@ app.get("/api/sessions/active", async (_req, res) => {
       });
     }
 
-    // 3. Recent session files (last 24h) not already seen
-    const claudeProjects = join(homedir(), ".claude", "projects");
-    if (existsSync(claudeProjects)) {
-      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-      const projectDirs = readdirSync(claudeProjects);
-
-      for (const dir of projectDirs.slice(0, 20)) {
-        const projectPath = join(claudeProjects, dir);
-        try {
-          const st = statSync(projectPath);
-          if (!st.isDirectory()) continue;
-
-          const files = readdirSync(projectPath)
-            .filter((f) => f.endsWith(".jsonl"))
-            .map((f) => ({
-              name: f,
-              sessionId: f.replace(".jsonl", ""),
-              mtime: statSync(join(projectPath, f)).mtimeMs,
-            }))
-            .filter((f) => f.mtime > cutoff && !seenSessionIds.has(f.sessionId))
-            .sort((a, b) => b.mtime - a.mtime)
-            .slice(0, 5);
-
-          const decoded = decodeProjectDir(dir);
-          const projName = friendlyProjectName(decoded);
-
-          for (const f of files) {
-            seenSessionIds.add(f.sessionId);
-            const title = getSessionTitle(f.sessionId);
-            activeSessions.push({
-              sessionId: f.sessionId,
-              label: title ? `${projName}: ${title}` : `Session — ${projName}`,
-              agentName: "Claude",
-              projectName: projName,
-              projectPath: decoded,
-              status: "idle",
-              lastActivity: f.mtime,
-              color: getSessionColor(f.sessionId),
-              isLive: false,
-              ideName: "Recent",
-            });
-          }
-        } catch {
-          continue;
-        }
-      }
+    // 3. Recent session files (last 24h) — cached to avoid expensive statSync per file
+    const recentSessions = await getRecentSessions(seenSessionIds);
+    for (const s of recentSessions) {
+      seenSessionIds.add(s.sessionId);
+      activeSessions.push(s);
     }
 
     // Sort: live first, then by last activity
@@ -1084,11 +1357,16 @@ const DATA_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "data
 mkdirSync(DATA_DIR, { recursive: true });
 const indexer = new Indexer(DATA_DIR);
 
-// Run initial index in background
-indexer.indexAll().then(() => {
-  console.log("[Indexer] Initial indexing complete");
-  indexer.startWatching();
-});
+// Defer initial indexing so the server can respond immediately with
+// stale-but-present data from the persisted SQLite database.  The DB
+// survives restarts, so stats/sessions are available from the start.
+// indexAll() is kicked off after a short delay to avoid blocking HTTP/WS.
+setTimeout(() => {
+  indexer.indexAll().then(() => {
+    console.log("[Indexer] Initial indexing complete");
+    indexer.startWatching();
+  });
+}, 2000);
 
 app.get("/api/history/projects", (_req, res) => {
   try {
@@ -1208,31 +1486,30 @@ setInterval(() => {
 // Routes — All Known Projects
 // ============================================================
 
-app.get("/api/projects", (_req, res) => {
+app.get("/api/projects", async (_req, res) => {
   try {
     const claudeProjects = join(homedir(), ".claude", "projects");
-    if (!existsSync(claudeProjects)) return res.json({ projects: [] });
+    try { await stat(claudeProjects); } catch { return res.json({ projects: [] }); }
 
-    const projectDirs = readdirSync(claudeProjects);
+    const projectDirs = await readdir(claudeProjects);
     const projects: Array<{ name: string; path: string; lastActivity: number }> = [];
     const seenPaths = new Set<string>();
 
     for (const dir of projectDirs) {
       const fullDir = join(claudeProjects, dir);
       try {
-        const st = statSync(fullDir);
+        const st = await stat(fullDir);
         if (!st.isDirectory()) continue;
 
         const decoded = decodeProjectDir(dir);
         if (seenPaths.has(decoded)) continue;
         seenPaths.add(decoded);
 
-        // Find most recent .jsonl file for last activity time
         let lastActivity = st.mtimeMs;
         try {
-          const files = readdirSync(fullDir).filter((f) => f.endsWith(".jsonl"));
+          const files = (await readdir(fullDir)).filter((f) => f.endsWith(".jsonl"));
           for (const f of files) {
-            const fstat = statSync(join(fullDir, f));
+            const fstat = await stat(join(fullDir, f));
             if (fstat.mtimeMs > lastActivity) lastActivity = fstat.mtimeMs;
           }
         } catch { /* ignore */ }
@@ -1244,7 +1521,6 @@ app.get("/api/projects", (_req, res) => {
       }
     }
 
-    // Sort by last activity (most recent first)
     projects.sort((a, b) => b.lastActivity - a.lastActivity);
     res.json({ projects });
   } catch (err: any) {
@@ -1275,6 +1551,109 @@ app.post("/api/projects/create", (req, res) => {
   }
 });
 
+app.get("/api/projects/tree", async (req, res) => {
+  const targetPath = req.query.path as string;
+  if (!targetPath) return res.status(400).json({ error: "path required" });
+
+  const resolved = resolve(targetPath);
+
+  try {
+    const st = await stat(resolved);
+    if (!st.isDirectory()) return res.status(400).json({ error: "not a directory" });
+  } catch {
+    return res.status(404).json({ error: "path not found" });
+  }
+
+  const IGNORED = new Set([
+    ".git", "node_modules", ".next", "__pycache__", ".venv", "dist", "build",
+    ".DS_Store", ".cache", ".turbo", ".svelte-kit", "coverage", ".nyc_output",
+  ]);
+  const MAX_ENTRIES = 200;
+
+  try {
+    const dirents = await readdir(resolved, { withFileTypes: true });
+    const entries: Array<{ name: string; path: string; type: "file" | "dir"; size?: number }> = [];
+
+    for (const d of dirents) {
+      if (IGNORED.has(d.name) || d.name.startsWith(".")) continue;
+      if (entries.length >= MAX_ENTRIES) break;
+
+      const fullPath = join(resolved, d.name);
+      const type = d.isDirectory() ? "dir" as const : "file" as const;
+
+      let size: number | undefined;
+      if (type === "file") {
+        try {
+          const fst = await stat(fullPath);
+          size = fst.size;
+        } catch { /* skip */ }
+      }
+
+      entries.push({ name: d.name, path: fullPath, type, size });
+    }
+
+    // Sort: directories first, then files, alphabetical within each group
+    entries.sort((a, b) => {
+      if (a.type !== b.type) return a.type === "dir" ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+
+    res.json({ entries });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "failed to read directory" });
+  }
+});
+
+app.get("/api/projects/file", async (req, res) => {
+  const filePath = req.query.path as string;
+  if (!filePath) return res.status(400).json({ error: "path required" });
+
+  const resolved = resolve(filePath);
+  const ext = extname(resolved).toLowerCase();
+
+  // Reject paths inside .git directories
+  if (resolved.includes("/.git/") || resolved.includes("\\.git\\")) {
+    return res.status(403).json({ error: "access denied" });
+  }
+
+  const ALLOWED = new Set([
+    ".md", ".prd", ".txt", ".json", ".yaml", ".yml", ".toml",
+    ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".rs", ".java",
+    ".css", ".html", ".svg", ".sh", ".sql", ".cfg", ".ini",
+    ".gitignore", ".editorconfig", ".env.example",
+  ]);
+
+  // Also allow files with no extension that are common config files
+  const base = basename(resolved);
+  const isAllowedNoExt = ["Makefile", "Dockerfile", "Procfile", "LICENSE", "Gemfile", "Rakefile"].includes(base);
+
+  if (!ALLOWED.has(ext) && !isAllowedNoExt) {
+    return res.status(403).json({ error: `file type '${ext || "none"}' not allowed` });
+  }
+
+  // Reject .env files (but allow .env.example)
+  if (base === ".env" || (base.startsWith(".env.") && !base.endsWith(".example"))) {
+    return res.status(403).json({ error: "env files not allowed" });
+  }
+
+  const MAX_SIZE = 500 * 1024; // 500KB
+
+  try {
+    const st = await stat(resolved);
+    if (!st.isFile()) return res.status(400).json({ error: "not a file" });
+    if (st.size > MAX_SIZE) {
+      return res.status(413).json({ error: "file too large", size: st.size });
+    }
+
+    const content = await readFile(resolved, "utf-8");
+    res.json({ content, extension: ext, size: st.size });
+  } catch (err: any) {
+    if (err.code === "ENOENT") return res.status(404).json({ error: "file not found" });
+    if (err.code === "EACCES") return res.status(403).json({ error: "permission denied" });
+    res.status(500).json({ error: err.message || "failed to read file" });
+  }
+});
+
 // ============================================================
 // Routes — Agent Spawning
 // ============================================================
@@ -1282,10 +1661,29 @@ app.post("/api/projects/create", (req, res) => {
 const spawnedProcesses = new Map<string, ChildProcess>();
 
 app.post("/api/spawn", (req, res) => {
-  const { prompt, projectPath } = req.body;
+  const { prompt, projectPath, agentType } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt required" });
 
   const spawnId = `spawn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const friendlyName = agentType ? agentTypeFriendlyName(agentType) : "Subagent";
+
+  // Create a real AgentState immediately so it appears in the city
+  const agentState: AgentState = {
+    agentId: spawnId,
+    displayName: friendlyName,
+    source: "claude",
+    isThinking: true,
+    currentCommand: undefined,
+    toolInput: undefined,
+    lastActivity: Date.now(),
+    status: "thinking",
+    waitingForApproval: false,
+    agentKind: "subagent",
+    agentType: agentType || undefined,
+    spawnId,
+  };
+  agents.set(spawnId, agentState);
+  broadcast("activity", { agent: agentState });
 
   try {
     const args = ["-p", prompt];
@@ -1302,6 +1700,9 @@ app.post("/api/spawn", (req, res) => {
 
     child.stdout?.on("data", (chunk: Buffer) => {
       output += chunk.toString();
+      // Keep agent alive while producing output
+      const agent = agents.get(spawnId);
+      if (agent) agent.lastActivity = Date.now();
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       output += chunk.toString();
@@ -1309,6 +1710,27 @@ app.post("/api/spawn", (req, res) => {
 
     child.on("close", (code) => {
       spawnedProcesses.delete(spawnId);
+
+      // Set agent to idle briefly, then remove after 10s
+      const agent = agents.get(spawnId);
+      if (agent) {
+        agent.status = "idle";
+        agent.isThinking = false;
+        agent.currentCommand = undefined;
+        agent.toolInput = undefined;
+        agent.lastActivity = Date.now();
+        broadcastThrottled("activity", { agent });
+
+        setTimeout(() => {
+          agents.delete(spawnId);
+          broadcast("agent-removed", { agentId: spawnId });
+          // Clean up reverse mapping
+          for (const [sid, sid2] of sessionToSpawnId) {
+            if (sid2 === spawnId) sessionToSpawnId.delete(sid);
+          }
+        }, 10_000);
+      }
+
       broadcast("spawn-complete", {
         spawnId,
         code,
@@ -1319,15 +1741,18 @@ app.post("/api/spawn", (req, res) => {
     child.unref();
     spawnedProcesses.set(spawnId, child);
 
-    // Notify all clients
     broadcast("spawn-started", {
       spawnId,
       prompt: prompt.slice(0, 100),
       projectPath: cwd,
+      agentType,
     });
 
     res.json({ ok: true, spawnId });
   } catch (err: any) {
+    // Remove agent on spawn failure
+    agents.delete(spawnId);
+    broadcast("agent-removed", { agentId: spawnId });
     res.status(500).json({ error: err.message });
   }
 });
@@ -1529,165 +1954,10 @@ app.post("/api/tts/assign", (req, res) => {
 });
 
 // ============================================================
-// Chat — Session JSONL watcher (fire-and-forget response pickup)
+// Chat — Session watcher state (entries cleared by session-end hook)
 // ============================================================
 
 const chatWatchers = new Map<string, ReturnType<typeof setInterval>>();
-
-/** Watch a Claude session JSONL file for ALL messages (user + assistant) and broadcast as chat.
- *  This is how messages from Cursor/VSCode Claude sessions flow into the Neon City chat panel. */
-function watchChatSession(sessionId: string, sessionLabel: string, agentName: string) {
-  if (chatWatchers.has(sessionId)) return; // already watching
-
-  // Find the session file
-  const claudeProjects = join(homedir(), ".claude", "projects");
-  if (!existsSync(claudeProjects)) return;
-
-  let sessionFile: string | null = null;
-  try {
-    const projectDirs = readdirSync(claudeProjects);
-    for (const dir of projectDirs) {
-      const candidate = join(claudeProjects, dir, `${sessionId}.jsonl`);
-      if (existsSync(candidate)) {
-        sessionFile = candidate;
-        break;
-      }
-    }
-  } catch {
-    return;
-  }
-
-  if (!sessionFile) {
-    console.log(`[chat-watch] Session file not found for ${sessionId}`);
-    return;
-  }
-
-  // Start from end of file (only read NEW entries)
-  let offset = statSync(sessionFile).size;
-  console.log(`[chat-watch] Watching ${sessionFile} (offset: ${offset})`);
-
-  const interval = setInterval(async () => {
-    try {
-      const currentSize = statSync(sessionFile!).size;
-      if (currentSize <= offset) return;
-
-      // Read new content
-      const stream = createReadStream(sessionFile!, { start: offset });
-      const rl = createInterface({ input: stream });
-      const newLines: string[] = [];
-      for await (const line of rl) {
-        newLines.push(line);
-      }
-      offset = currentSize;
-
-      // Parse JSONL for user AND assistant messages
-      // Claude JSONL uses type "user" for user msgs, type "assistant" for assistant msgs
-      for (const line of newLines) {
-        try {
-          const entry = JSON.parse(line);
-          const role = entry.type === "user" ? "user"
-            : entry.type === "assistant" ? "assistant"
-            : entry.message?.role;
-          if (role !== "assistant" && role !== "user") continue;
-          if (!entry.message?.content) continue;
-
-          // Extract text content
-          let text = "";
-          const content = entry.message.content;
-          if (typeof content === "string") {
-            text = content;
-          } else if (Array.isArray(content)) {
-            text = content
-              .filter((b: any) => b.type === "text")
-              .map((b: any) => b.text)
-              .join("\n");
-          }
-
-          // Detect tool_use blocks in assistant messages
-          if (role === "assistant" && Array.isArray(content)) {
-            for (const block of content) {
-              if (block.type === "tool_use" && block.name && block.id) {
-                const actId = `tool-${++toolActivityCounter}`;
-                const activity: ToolActivity = {
-                  id: actId,
-                  toolUseId: block.id,
-                  agentId: sessionId,
-                  agentName,
-                  sessionId,
-                  toolName: block.name,
-                  toolInput: summarizeToolInput(block.name, block.input),
-                  status: "running",
-                  startedAt: Date.now(),
-                };
-                toolActivities.set(block.id, activity);
-                if (toolActivities.size > 200) {
-                  const oldest = toolActivities.keys().next().value;
-                  if (oldest) toolActivities.delete(oldest);
-                }
-                broadcast("tool-activity", activity);
-              }
-            }
-          }
-
-          // Detect tool_result blocks in user messages
-          if (role === "user" && Array.isArray(content)) {
-            for (const block of content) {
-              if (block.type === "tool_result" && block.tool_use_id) {
-                const tracked = toolActivities.get(block.tool_use_id);
-                if (tracked) {
-                  tracked.status = block.is_error ? "error" : "complete";
-                  tracked.completedAt = Date.now();
-                  if (block.is_error) {
-                    tracked.error = typeof block.content === "string"
-                      ? block.content.slice(0, 200)
-                      : "Tool returned error";
-                  }
-                  broadcast("tool-activity", tracked);
-                }
-              }
-            }
-          }
-
-          if (!text) continue;
-
-          // Skip if this message was already sent via chat panel (avoid dupes)
-          const isDupe = chatHistory.some(
-            (m) => m.sessionId === sessionId && m.role === role
-              && m.content === text && Date.now() - m.timestamp < 5000
-          );
-          if (isDupe) continue;
-
-          // Broadcast as chat message
-          const chatMsg: ChatMessage = {
-            id: `msg-${++chatCounter}`,
-            role: role as "user" | "assistant",
-            content: text,
-            agentId: sessionId,
-            agentName: role === "assistant" ? agentName : undefined,
-            sessionId,
-            sessionLabel,
-            timestamp: Date.now(),
-          };
-          chatHistory.push(chatMsg);
-          broadcast("chat-message", chatMsg);
-        } catch {
-          // Skip unparseable lines
-        }
-      }
-    } catch {
-      // File might not exist yet or be locked
-    }
-  }, 100); // Poll every 100ms for responsive chat
-
-  chatWatchers.set(sessionId, interval);
-
-  // Auto-cleanup after 2 hours (matches voice watcher lifetime)
-  setTimeout(() => {
-    clearInterval(interval);
-    chatWatchers.delete(sessionId);
-    console.log(`[chat-watch] Stopped watching ${sessionId}`);
-  }, 7_200_000);
-}
 
 // ============================================================
 // Voice — Session file watcher (detect assistant messages)
@@ -1727,7 +1997,8 @@ function watchSessionFile(filePath: string, agentId: string) {
 
   const checkInterval = setInterval(async () => {
     try {
-      const currentSize = statSync(filePath).size;
+      const st = await stat(filePath);
+      const currentSize = st.size;
       const state = watchedSessions.get(filePath);
       if (!state || currentSize <= state.offset) return;
 
@@ -1830,29 +2101,20 @@ app.get("/api/voice/status", (_req, res) => {
 });
 
 // Auto-watch session files for known agents
-function maybeWatchAgent(agentId: string) {
-  // Try to find this agent's session file
+async function maybeWatchAgent(agentId: string) {
   const claudeProjects = join(homedir(), ".claude", "projects");
-  if (!existsSync(claudeProjects)) return;
+  try { await stat(claudeProjects); } catch { return; }
 
-  // The agentId from hooks IS the session_id, which matches the JSONL filename
   try {
-    const projectDirs = readdirSync(claudeProjects);
+    const projectDirs = await readdir(claudeProjects);
     for (const dir of projectDirs) {
       const sessionFile = join(claudeProjects, dir, `${agentId}.jsonl`);
-      if (existsSync(sessionFile)) {
-        // Watch for voice (TTS)
-        watchSessionFile(sessionFile, agentId);
+      try {
+        await stat(sessionFile);
+      } catch { continue; }
 
-        // Watch for chat — stream all messages to the chat panel
-        const agent = agents.get(agentId);
-        const project = findSessionProject(agentId);
-        const label = project
-          ? `${agent?.displayName || "Claude"} — ${project.projectName}`
-          : agent?.displayName || "Claude";
-        watchChatSession(agentId, label, agent?.displayName || "Claude");
-        return;
-      }
+      watchSessionFile(sessionFile, agentId);
+      return;
     }
   } catch {
     // Ignore
@@ -1970,18 +2232,26 @@ app.post("/api/weather/set", (req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const [id, agent] of agents) {
+    // Don't remove subagents whose process is still alive
+    if (agent.agentKind === "subagent" && agent.spawnId && spawnedProcesses.has(agent.spawnId)) {
+      agent.lastActivity = now; // keep alive while process runs
+      continue;
+    }
+    // Never remove citizen placeholder agents (they're permanent city residents)
+    if (id.startsWith("citizen-")) continue;
     if (now - agent.lastActivity > 120_000) {
       agents.delete(id);
+      clearIdleTimer(id);
       broadcast("agent-removed", { agentId: id });
     } else if (
-      now - agent.lastActivity > 30_000 &&
+      now - agent.lastActivity > (agent.agentKind === "session" ? 90_000 : 30_000) &&
       agent.status !== "idle" &&
       !agent.waitingForApproval
     ) {
       agent.status = "idle";
       agent.currentCommand = undefined;
       agent.toolInput = undefined;
-      broadcast("thinking", { agents: Array.from(agents.values()) });
+      broadcastThrottled("thinking", { agents: Array.from(agents.values()) });
     }
   }
 }, 5_000);
@@ -1990,7 +2260,7 @@ setInterval(() => {
 // Start
 // ============================================================
 
-const PORT = parseInt(process.env.PORT || "5174");
+const PORT = parseInt(process.env.SERVER_PORT || "5174");
 server.listen(PORT, () => {
   console.log(`Neon City server on http://localhost:${PORT}`);
   console.log(`WebSocket on ws://localhost:${PORT}/ws`);
@@ -1998,10 +2268,34 @@ server.listen(PORT, () => {
   // TTS worker starts on-demand when voice is first enabled (not on boot)
   // startTTSWorker();
 
-  // Start session discovery scanners
-  scanLockFiles();
-  setInterval(scanLockFiles, 3000);
-  setInterval(scanTerminalSessions, 10000);
+  // Populate idle subagent citizens — one per available agent type.
+  // These are placeholder agents that hang out in the city (park, cafe, bar)
+  // until summoned. When a real spawn happens, it replaces the placeholder.
+  const CITIZEN_AGENT_TYPES = [
+    "general-purpose", "frontend-developer", "backend-developer", "ui-designer",
+    "mobile-developer", "mobile-app-developer", "debugger", "code-reviewer",
+    "security-engineer", "security-auditor", "data-analyst", "database-administrator",
+    "ai-engineer", "project-manager", "business-analyst", "seo-specialist",
+    "content-marketer", "multi-agent-coordinator", "explore", "plan",
+  ];
+  for (let i = 0; i < CITIZEN_AGENT_TYPES.length; i++) {
+    const agentType = CITIZEN_AGENT_TYPES[i]!;
+    const citizenId = `citizen-${agentType}`;
+    // ~30% of citizens walk around, the rest hang out idle
+    const isWalker = i % 3 === 0;
+    agents.set(citizenId, {
+      agentId: citizenId,
+      displayName: agentTypeFriendlyName(agentType),
+      source: "claude",
+      isThinking: false,
+      lastActivity: Date.now(),
+      status: isWalker ? "walking" : "idle",
+      waitingForApproval: false,
+      agentKind: "subagent",
+      agentType,
+    });
+  }
+  console.log(`[citizens] Populated ${CITIZEN_AGENT_TYPES.length} idle subagent citizens`);
 });
 
 // Clean shutdown

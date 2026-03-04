@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState, useCallback } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useVoice } from "../hooks/useVoice";
 import type { RawMessageListener } from "../hooks/useCityState";
+import { formatTime } from "../shared/format";
 
 interface ChatMessage {
   id: string;
@@ -184,6 +187,36 @@ function SessionDropdown({ sessions, selectedId, onChange, speakingSessionId }: 
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CodeBlock — renders fenced code blocks with a copy button
+// ---------------------------------------------------------------------------
+
+function CodeBlock({ children, className }: { children?: React.ReactNode; className?: string }) {
+  const [copied, setCopied] = useState(false);
+  const text = String(children).replace(/\n$/, "");
+  const isBlock = className || (typeof children === "string" && children.includes("\n"));
+
+  if (!isBlock) {
+    return <code className={className}>{children}</code>;
+  }
+
+  return (
+    <div style={{ position: "relative" }}>
+      <button
+        className="code-copy-btn"
+        onClick={() => {
+          navigator.clipboard.writeText(text);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        }}
+      >
+        {copied ? "Copied!" : "Copy"}
+      </button>
+      <pre><code className={className}>{children}</code></pre>
     </div>
   );
 }
@@ -460,7 +493,16 @@ export function ChatPanel({ open, onClose, subscribe, subscribeToMessages }: Pro
                 <span className="msg-agent">{msg.agentName}</span>
               )}
             </div>
-            <div className="msg-content">{msg.content}</div>
+            <div className={`msg-content${msg.role === "assistant" ? " md" : ""}`}>
+              {msg.role === "assistant" ? (
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={{ code: CodeBlock }}
+                >
+                  {msg.content}
+                </ReactMarkdown>
+              ) : msg.content}
+            </div>
             <div className="msg-meta">{formatTime(msg.timestamp)}</div>
           </div>
         ))}
@@ -474,6 +516,7 @@ export function ChatPanel({ open, onClose, subscribe, subscribeToMessages }: Pro
         <div className="chat-input-wrap">
           <textarea
             ref={inputRef}
+            name="chat-message"
             className="chat-input"
             placeholder={placeholder}
             rows={1}
@@ -496,9 +539,3 @@ export function ChatPanel({ open, onClose, subscribe, subscribeToMessages }: Pro
   );
 }
 
-function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}

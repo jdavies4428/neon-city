@@ -38,7 +38,7 @@ export function getCityApp(): Application | null {
  * relying on `resizeTo`, which can cause infinite ResizeObserver loops.
  */
 export function resizeCityApp(width: number, height: number): void {
-  if (!app) return;
+  if (!app?.renderer) return;
   app.renderer.resize(width, height);
 }
 

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { RawMessageListener } from "../hooks/useCityState";
+import { formatTime } from "../shared/format";
 
 interface Notification {
   id: string;
@@ -348,14 +349,3 @@ function toolIcon(toolName: string): string {
   }
 }
 
-function formatTime(ts: number): string {
-  const d = new Date(ts);
-  const now = new Date();
-  const diffMs = now.getTime() - d.getTime();
-  const diffMin = Math.floor(diffMs / 60000);
-
-  if (diffMin < 1) return "just now";
-  if (diffMin < 60) return `${diffMin}m ago`;
-
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}

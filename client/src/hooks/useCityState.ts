@@ -9,6 +9,9 @@ export interface AgentState {
   toolInput?: string;
   lastActivity: number;
   status: "idle" | "reading" | "writing" | "thinking" | "stuck" | "walking";
+  agentKind?: "session" | "subagent";
+  agentType?: string;
+  colorIndex?: number;
 }
 
 export interface WeatherInfo {
@@ -71,10 +74,27 @@ export function useCityState() {
             stateRef.current.weather = msg.data.weather;
           }
           notify();
+
+          // Immediately re-dispatch bundled stats so SessionStats and
+          // PowerGridModal populate on connect rather than waiting up to
+          // 10 seconds for the server's periodic broadcast.
+          if (msg.data.stats && Object.keys(msg.data.stats).length > 0) {
+            for (const listener of rawListenersRef.current) {
+              listener({ type: "stats", data: msg.data.stats });
+            }
+          }
         } else if (msg.type === "thinking") {
-          stateRef.current.agents.clear();
+          // Merge server agents (don't clear — preserves synthetic session- agents)
+          const serverIds = new Set<string>();
           for (const agent of msg.data.agents) {
+            serverIds.add(agent.agentId);
             stateRef.current.agents.set(agent.agentId, agent);
+          }
+          // Prune agents the server no longer reports, but keep synthetics & citizens
+          for (const id of stateRef.current.agents.keys()) {
+            if (!serverIds.has(id) && !id.startsWith("session-") && !id.startsWith("citizen-")) {
+              stateRef.current.agents.delete(id);
+            }
           }
           notify();
         } else if (msg.type === "activity") {
@@ -127,5 +147,5 @@ export function useCityState() {
     []
   );
 
-  return { stateRef, subscribe, subscribeToMessages };
+  return { stateRef, subscribe, subscribeToMessages, notify };
 }

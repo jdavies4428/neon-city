@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef } from "react";
+import { formatTokens } from "../shared/format";
 
 interface TokenData {
   totalTokens: number;
@@ -103,10 +104,4 @@ export function TokenMeter() {
       </div>
     </div>
   );
-}
-
-function formatTokens(n: number): string {
-  if (n < 1000) return String(n);
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`;
-  return `${(n / 1_000_000).toFixed(2)}M`;
 }

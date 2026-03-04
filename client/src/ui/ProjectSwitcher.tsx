@@ -6,9 +6,10 @@ interface Props {
   onClose: () => void;
   onSelectProject: (project: HistoryProject) => void;
   currentWeather: string;
+  onProjectDetail?: (project: HistoryProject) => void;
 }
 
-export function ProjectSwitcher({ open, onClose, onSelectProject, currentWeather }: Props) {
+export function ProjectSwitcher({ open, onClose, onSelectProject, currentWeather, onProjectDetail }: Props) {
   const [projects, setProjects] = useState<HistoryProject[]>([]);
   const [loading, setLoading] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
@@ -107,6 +108,7 @@ export function ProjectSwitcher({ open, onClose, onSelectProject, currentWeather
         {showNewProject && (
           <div className="new-project-row">
             <input
+              name="new-project"
               className="new-project-input"
               type="text"
               placeholder="Enter project name (e.g. my-app)"
@@ -139,9 +141,13 @@ export function ProjectSwitcher({ open, onClose, onSelectProject, currentWeather
               key={p.id}
               className="project-card"
               onClick={() => {
-                onSelectProject(p);
-                handleOpenProject(p.path || p.name);
-                onClose();
+                if (onProjectDetail) {
+                  onProjectDetail(p);
+                } else {
+                  onSelectProject(p);
+                  handleOpenProject(p.path || p.name);
+                  onClose();
+                }
               }}
             >
               {/* Mini city preview */}

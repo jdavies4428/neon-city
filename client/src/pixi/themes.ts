@@ -60,11 +60,13 @@ export interface CityTheme {
   };
 
   district: {
-    creative: { primary: number; secondary: number; sign: string };
-    data: { primary: number; secondary: number; sign: string };
-    qc: { primary: number; secondary: number; sign: string };
+    social: { primary: number; secondary: number; sign: string };
+    library: { primary: number; secondary: number; sign: string };
     workshop: { primary: number; secondary: number; sign: string };
-    arts: { primary: number; secondary: number; sign: string };
+    terminal: { primary: number; secondary: number; sign: string };
+    qc: { primary: number; secondary: number; sign: string };
+    studio: { primary: number; secondary: number; sign: string };
+    hq: { primary: number; secondary: number; sign: string };
   };
 
   background: number;
@@ -128,11 +130,13 @@ export const THEME_CITY: CityTheme = {
   },
 
   district: {
-    creative: { primary: 0xff40aa, secondary: 0xff80cc, sign: "CREATIVE" },
-    data: { primary: 0x40ff80, secondary: 0x80ffaa, sign: "DATA TOWER" },
-    qc: { primary: 0x40ddff, secondary: 0x80eeff, sign: "QC LAB" },
-    workshop: { primary: 0xffd050, secondary: 0xffe080, sign: "WORKSHOP" },
-    arts: { primary: 0x8840ff, secondary: 0xaa80ff, sign: "ARTS" },
+    social:   { primary: 0xffaa44, secondary: 0xffcc88, sign: "CHILL ZONE" },
+    library:  { primary: 0xffd050, secondary: 0xffe080, sign: "LIBRARY" },
+    workshop: { primary: 0x40ff80, secondary: 0x80ffaa, sign: "WORKSHOP" },
+    terminal: { primary: 0xff8840, secondary: 0xffaa66, sign: "TERMINAL" },
+    qc:       { primary: 0x40ddff, secondary: 0x80eeff, sign: "QC LAB" },
+    studio:   { primary: 0xff40aa, secondary: 0xff80cc, sign: "STUDIO" },
+    hq:       { primary: 0x8840ff, secondary: 0xaa80ff, sign: "HQ" },
   },
 
   background: 0x05050f,
@@ -196,11 +200,13 @@ export const THEME_BEACH: CityTheme = {
   },
 
   district: {
-    creative: { primary: 0xff6688, secondary: 0xff88aa, sign: "SURF SHACK" },
-    data: { primary: 0x66dd88, secondary: 0x88ffaa, sign: "LIGHTHOUSE" },
-    qc: { primary: 0x44ddcc, secondary: 0x66ffee, sign: "TIDE POOL" },
-    workshop: { primary: 0xffcc44, secondary: 0xffdd66, sign: "BOAT HOUSE" },
-    arts: { primary: 0xaa66cc, secondary: 0xcc88ee, sign: "GALLERY" },
+    social:   { primary: 0xffcc44, secondary: 0xffdd66, sign: "TIKI BAR" },
+    library:  { primary: 0x66dd88, secondary: 0x88ffaa, sign: "LIGHTHOUSE" },
+    workshop: { primary: 0x44ddcc, secondary: 0x66ffee, sign: "BOAT HOUSE" },
+    terminal: { primary: 0xff8844, secondary: 0xffaa66, sign: "DOCK" },
+    qc:       { primary: 0x44aaff, secondary: 0x66ccff, sign: "TIDE POOL" },
+    studio:   { primary: 0xff6688, secondary: 0xff88aa, sign: "SURF SHACK" },
+    hq:       { primary: 0xaa66cc, secondary: 0xcc88ee, sign: "CAPTAIN'S" },
   },
 
   background: 0x0a1025,
@@ -264,11 +270,13 @@ export const THEME_SPACE: CityTheme = {
   },
 
   district: {
-    creative: { primary: 0xee44aa, secondary: 0xff66cc, sign: "MODULE A" },
-    data: { primary: 0x33ee77, secondary: 0x66ff99, sign: "CORE SYS" },
-    qc: { primary: 0x33ccee, secondary: 0x66ddff, sign: "DIAGNOSTICS" },
-    workshop: { primary: 0xddcc44, secondary: 0xeedd66, sign: "ENGINEERING" },
-    arts: { primary: 0x7733ee, secondary: 0x9966ff, sign: "COMMS" },
+    social:   { primary: 0xddcc44, secondary: 0xeedd66, sign: "MESS HALL" },
+    library:  { primary: 0x33ee77, secondary: 0x66ff99, sign: "CORE SYS" },
+    workshop: { primary: 0x33ccee, secondary: 0x66ddff, sign: "ENGINEERING" },
+    terminal: { primary: 0xee7733, secondary: 0xff9955, sign: "BRIDGE" },
+    qc:       { primary: 0x3366ff, secondary: 0x5588ff, sign: "DIAGNOSTICS" },
+    studio:   { primary: 0xee44aa, secondary: 0xff66cc, sign: "MODULE A" },
+    hq:       { primary: 0x7733ee, secondary: 0x9966ff, sign: "COMMAND" },
   },
 
   background: 0x020208,

@@ -282,6 +282,7 @@ export function SpawnModal({ open, onClose, initialPrompt, initialProjectPath }:
           <label className="spawn-label">Open Project</label>
           <div className="spawn-select-wrap">
             <select
+              name="spawn-project"
               className="spawn-select"
               value={selectedProjectPath}
               onChange={(e) => setSelectedProjectPath(e.target.value)}
@@ -316,6 +317,7 @@ export function SpawnModal({ open, onClose, initialPrompt, initialProjectPath }:
           <label className="spawn-label">Task</label>
           <textarea
             ref={inputRef}
+            name="spawn-task"
             className="spawn-input"
             placeholder="What should the agent work on?"
             value={prompt}

@@ -1,12 +1,35 @@
 /** Neon City color palette — all colors for the pixel art city */
 
 export const PALETTE = {
-  // Sky
-  skyTop: 0x05050f,
-  skyBottom: 0x0a0a2a,
+  // Sky (night)
+  skyTop: 0x0a0a20,
+  skyBottom: 0x10103a,
   stars: 0xffffff,
   moon: 0xffffdd,
   moonGlow: 0x4444aa,
+
+  // Sky (daytime) — bright blue sky
+  skyDayTop: 0x3388dd,
+  skyDayBottom: 0x88bbee,
+  sunColor: 0xffee77,
+  sunGlow: 0xffcc44,
+
+  // Buildings (daytime) — lighter silhouettes
+  buildingDayDark: 0x223355,
+  buildingDayMid: 0x2a3d66,
+  buildingDayLight: 0x3a5080,
+  buildingDayEdge: 0x4466aa,
+  windowDayOff: 0x2a3d66,
+  windowDayDim: 0x445588,
+  windowDayLit: 0x6688bb,
+
+  // Road / ground (daytime)
+  roadDayDark: 0x334455,
+  roadDayMid: 0x445566,
+  sidewalkDay: 0x556677,
+
+  // Cloud (daytime)
+  cloudDay: 0xddddee,
 
   // Buildings
   buildingDark: 0x0c0c1e,
@@ -63,11 +86,13 @@ export const PALETTE = {
 
 /** District theme colors */
 export const DISTRICT_THEMES = {
-  creative: { primary: 0xff40aa, secondary: 0xff80cc, sign: "CREATIVE" },
-  data: { primary: 0x40ff80, secondary: 0x80ffaa, sign: "DATA TOWER" },
-  qc: { primary: 0x40ddff, secondary: 0x80eeff, sign: "QC LAB" },
-  workshop: { primary: 0xffd050, secondary: 0xffe080, sign: "WORKSHOP" },
-  arts: { primary: 0x8840ff, secondary: 0xaa80ff, sign: "ARTS" },
+  social:   { primary: 0x40cc60, secondary: 0x80ff99, sign: "PARK" },
+  library:  { primary: 0xffd050, secondary: 0xffe080, sign: "LIBRARY" },
+  workshop: { primary: 0x40ff80, secondary: 0x80ffaa, sign: "WORKSHOP" },
+  terminal: { primary: 0xff8840, secondary: 0xffaa66, sign: "TERMINAL" },
+  qc:       { primary: 0x40ddff, secondary: 0x80eeff, sign: "QC LAB" },
+  studio:   { primary: 0xff40aa, secondary: 0xff80cc, sign: "STUDIO" },
+  hq:       { primary: 0x8840ff, secondary: 0xaa80ff, sign: "HQ" },
 } as const;
 
 export type DistrictType = keyof typeof DISTRICT_THEMES;
