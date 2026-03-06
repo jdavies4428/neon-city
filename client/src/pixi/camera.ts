@@ -184,7 +184,11 @@ export class Camera {
    */
   fitToWidth(worldWidth: number) {
     const screenW = this.app.screen.width;
+    const screenH = this.app.screen.height;
     if (screenW <= 0 || worldWidth <= 0) return;
+
+    // Update pivot to match current screen dimensions (may change on resize)
+    this.world.pivot.set(screenW / 2, screenH / 2);
 
     const fitZoom = screenW / worldWidth;
     // Allow fit zoom to go below the normal minZoom floor (e.g. on very narrow
@@ -217,6 +221,9 @@ export class Camera {
     const screenW = this.app.screen.width;
     const screenH = this.app.screen.height;
     if (screenW <= 0 || screenH <= 0 || contentWidth <= 0) return;
+
+    // Update pivot to match current screen dimensions (may change on resize)
+    this.world.pivot.set(screenW / 2, screenH / 2);
 
     // Width-based zoom: city fills the viewport horizontally
     const fitZoom = screenW / contentWidth;

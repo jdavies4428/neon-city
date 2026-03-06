@@ -430,9 +430,10 @@ export class CityRenderer {
       }
     }
 
-    // Streetlamps
+    // Streetlamps — stop at HQ right edge, not past it
     const lampSpacing = 120;
-    for (let x = 60; x < this.width; x += lampSpacing) {
+    const lampLimit = HQ_X + 130; // HQ right edge
+    for (let x = 60; x < lampLimit; x += lampSpacing) {
       const lamp = createStreetlamp();
       lamp.x = x;
       lamp.y = this.roadY;
@@ -810,11 +811,17 @@ export class CityRenderer {
       return { x, y: sidewalkY };
     }
 
+    // Max x boundary — agents must stay within HQ right edge
+    const maxX = (this.buildingPositions.get("HQ")?.x ?? 1420) + 130 - 20;
+
     // Idle: session agents go to Bar, subagents go to their home building's sidewalk or social spots
     if (agentKind === "session") {
       const barPos = this.buildingPositions.get("Bar");
       const spot = barPos || { x: 830, y: this.roadY, width: 110, height: 50 };
-      return { x: spot.x + 20 + agentIndex * spacing, y: sidewalkY };
+      const rawX = spot.x + 20 + agentIndex * spacing;
+      // Wrap within spot width if overflowing
+      const x = rawX > maxX ? spot.x + 20 + ((agentIndex * spacing) % Math.max(spot.width - 20, spacing)) : rawX;
+      return { x, y: sidewalkY - 28 };
     }
 
     // Idle subagents: go to home building sidewalk area
@@ -823,7 +830,9 @@ export class CityRenderer {
       if (home) {
         const pos = this.buildingPositions.get(home);
         if (pos) {
-          return { x: pos.x + 20 + agentIndex * spacing, y: sidewalkY };
+          const rawX = pos.x + 20 + agentIndex * spacing;
+          const x = rawX > maxX ? pos.x + 20 + ((agentIndex * spacing) % Math.max(pos.width - 20, spacing)) : rawX;
+          return { x, y: sidewalkY };
         }
       }
     }

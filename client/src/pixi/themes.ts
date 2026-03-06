@@ -282,8 +282,78 @@ export const THEME_SPACE: CityTheme = {
   background: 0x020208,
 };
 
+/** Dawn / light-warm theme */
+export const THEME_DAWN: CityTheme = {
+  id: "dawn",
+  name: "City Dawn",
+  icon: "🌅",
+
+  sky: {
+    top: 0x4a90d9,
+    bottom: 0xffeedd,
+    stars: 0xffffff,
+    moon: 0xfff8e0,
+    moonGlow: 0xfff0c0,
+  },
+
+  building: {
+    dark: 0x8090a0,
+    mid: 0xa0b0c0,
+    light: 0xc0d0e0,
+    edge: 0x90a0b0,
+    windowOff: 0xb0c0d0,
+    windowDim: 0xc8d8e8,
+    windowLit: 0x40a0ff,
+    windowWarm: 0xffd080,
+  },
+
+  road: {
+    dark: 0x707880,
+    mid: 0x909aa0,
+    line: 0xffffff,
+    lineYellow: 0xffcc00,
+    sidewalk: 0xc0c8d0,
+  },
+
+  neon: {
+    blue: 0x2070dd,
+    pink: 0xdd3090,
+    green: 0x20aa50,
+    yellow: 0xddaa00,
+    cyan: 0x2099bb,
+    orange: 0xdd6620,
+    purple: 0x7030cc,
+    red: 0xdd2020,
+  },
+
+  glow: {
+    read: 0xddaa00,
+    write: 0x20aa50,
+    search: 0x2070dd,
+    bash: 0xdd6620,
+  },
+
+  lamp: {
+    post: 0x606870,
+    light: 0xfff0d0,
+    glow: 0xffeebb,
+  },
+
+  district: {
+    social:   { primary: 0xdd3090, secondary: 0xffccee, sign: "CAFE" },
+    library:  { primary: 0xddaa00, secondary: 0xfff0cc, sign: "LIBRARY" },
+    workshop: { primary: 0x20aa50, secondary: 0xccffdd, sign: "WORKSHOP" },
+    terminal: { primary: 0xdd6620, secondary: 0xffdcc0, sign: "TERMINAL" },
+    qc:       { primary: 0x2099bb, secondary: 0xccf0ff, sign: "QC LAB" },
+    studio:   { primary: 0xdd3090, secondary: 0xffccee, sign: "STUDIO" },
+    hq:       { primary: 0x7030cc, secondary: 0xe0ccff, sign: "HQ" },
+  },
+
+  background: 0xe8eef4,
+};
+
 /** All available themes */
-export const ALL_THEMES: CityTheme[] = [THEME_CITY, THEME_BEACH, THEME_SPACE];
+export const ALL_THEMES: CityTheme[] = [THEME_CITY, THEME_BEACH, THEME_SPACE, THEME_DAWN];
 
 /** Get theme by ID */
 export function getTheme(id: string): CityTheme {

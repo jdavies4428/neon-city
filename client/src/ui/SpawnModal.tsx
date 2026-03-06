@@ -1,10 +1,12 @@
 import { useState, useRef, useEffect } from "react";
+import type { WorkspaceTarget } from "../shared/contracts";
 
 interface Props {
   open: boolean;
   onClose: () => void;
   initialPrompt?: string;
   initialProjectPath?: string;
+  currentWorkspace: WorkspaceTarget | null;
 }
 
 interface ProjectOption {
@@ -19,6 +21,65 @@ interface AgentTypePreset {
   desc: string;
   template: string;
 }
+
+interface AgentTemplate {
+  label: string;
+  prompt: string;
+}
+
+const AGENT_TEMPLATES: Record<string, AgentTemplate[]> = {
+  "general-purpose": [
+    { label: "Explain this codebase", prompt: "Explore and explain the structure of this codebase. What does it do, what technologies does it use, and how is it organized?" },
+    { label: "Fix an issue", prompt: "I'm having an issue with: [describe the problem]. Please investigate and fix it." },
+    { label: "Add a feature", prompt: "I'd like to add a new feature: [describe what you want]. Please plan and implement it." },
+  ],
+  "frontend-developer": [
+    { label: "Add a new page", prompt: "Create a new page/route for: [describe the page]. Match the existing design patterns." },
+    { label: "Fix the styling", prompt: "The styling is broken on: [describe what looks wrong]. Please fix it to match the expected design." },
+    { label: "Make it responsive", prompt: "Make the [component/page] responsive for mobile, tablet, and desktop viewports." },
+    { label: "Add a component", prompt: "Create a new reusable component for: [describe the component]. Include proper props and styling." },
+  ],
+  "backend-developer": [
+    { label: "Add an API endpoint", prompt: "Create a new API endpoint for: [describe what it should do]. Include validation and error handling." },
+    { label: "Fix a server bug", prompt: "There's a bug in the backend: [describe the issue]. Please investigate and fix it." },
+    { label: "Add database migration", prompt: "Create a database migration to: [describe schema changes needed]." },
+  ],
+  "debugger": [
+    { label: "Fix this error", prompt: "I'm getting this error: [paste the error message]. Please find the root cause and fix it." },
+    { label: "App crashes when...", prompt: "The app crashes when I try to: [describe the action]. Please debug and fix it." },
+    { label: "Performance issue", prompt: "The app is running slowly when: [describe when]. Please profile and optimize." },
+  ],
+  "code-reviewer": [
+    { label: "Review latest changes", prompt: "Review all recent code changes in this project. Check for bugs, security issues, and code quality." },
+    { label: "Security review", prompt: "Perform a security-focused code review. Look for vulnerabilities, injection risks, and auth issues." },
+    { label: "Best practices audit", prompt: "Audit this codebase for best practices. Check patterns, naming, error handling, and test coverage." },
+  ],
+  "ui-designer": [
+    { label: "Improve the design", prompt: "Review the current UI design and suggest improvements for better UX, accessibility, and visual appeal." },
+    { label: "Create a design system", prompt: "Create a consistent design system with colors, typography, spacing, and component styles." },
+    { label: "Dark mode support", prompt: "Add dark mode / theme support to the existing UI components." },
+  ],
+  "data-analyst": [
+    { label: "Analyze this data", prompt: "Analyze the data in [file/database] and provide insights, trends, and visualizations." },
+    { label: "Create a dashboard", prompt: "Create a dashboard showing key metrics for: [describe what you want to track]." },
+  ],
+  "database-administrator": [
+    { label: "Optimize queries", prompt: "Review and optimize the database queries in this project for better performance." },
+    { label: "Design schema", prompt: "Design a database schema for: [describe the data model needed]." },
+  ],
+  "ai-engineer": [
+    { label: "Add AI features", prompt: "Integrate AI/ML capabilities into this project for: [describe the AI feature]." },
+    { label: "Optimize prompts", prompt: "Review and optimize the AI prompts in this codebase for better quality and cost efficiency." },
+  ],
+  "security-engineer": [
+    { label: "Harden the app", prompt: "Review and harden the security of this application. Add missing security controls." },
+    { label: "Add authentication", prompt: "Implement authentication and authorization for this application." },
+  ],
+  "project-manager": [
+    { label: "Create a project plan", prompt: "Analyze this codebase and create a project plan for: [describe the goal]. Include milestones and tasks." },
+    { label: "Assess technical debt", prompt: "Assess the technical debt in this project and prioritize what should be addressed first." },
+  ],
+};
 
 const AGENT_TYPES: AgentTypePreset[] = [
   {
@@ -163,7 +224,7 @@ const AGENT_TYPES: AgentTypePreset[] = [
   },
 ];
 
-export function SpawnModal({ open, onClose, initialPrompt, initialProjectPath }: Props) {
+export function SpawnModal({ open, onClose, initialPrompt, initialProjectPath, currentWorkspace }: Props) {
   const [prompt, setPrompt] = useState("");
   const [selectedProjectPath, setSelectedProjectPath] = useState("");
   const [selectedAgentType, setSelectedAgentType] = useState("general-purpose");
@@ -195,7 +256,7 @@ export function SpawnModal({ open, onClose, initialPrompt, initialProjectPath }:
   useEffect(() => {
     if (open) {
       setPrompt(initialPrompt || "");
-      setSelectedProjectPath(initialProjectPath || "");
+      setSelectedProjectPath(initialProjectPath || currentWorkspace?.projectPath || "");
       setResult(null);
       setSpawning(false);
       if (!initialPrompt) {
@@ -203,7 +264,7 @@ export function SpawnModal({ open, onClose, initialPrompt, initialProjectPath }:
       }
       setTimeout(() => inputRef.current?.focus(), 100);
     }
-  }, [open, initialPrompt, initialProjectPath]);
+  }, [open, initialPrompt, initialProjectPath, currentWorkspace]);
 
   function handleSelectAgentType(typeId: string) {
     setSelectedAgentType(typeId);
@@ -280,6 +341,11 @@ export function SpawnModal({ open, onClose, initialPrompt, initialProjectPath }:
         <div className="spawn-body">
           {/* Project selector */}
           <label className="spawn-label">Open Project</label>
+          {currentWorkspace && (
+            <div className="spawn-workspace-hint">
+              Current workspace: <strong>{currentWorkspace.projectName}</strong>
+            </div>
+          )}
           <div className="spawn-select-wrap">
             <select
               name="spawn-project"
@@ -312,6 +378,27 @@ export function SpawnModal({ open, onClose, initialPrompt, initialProjectPath }:
               </button>
             ))}
           </div>
+
+          {/* Task templates */}
+          {selectedAgentType && AGENT_TEMPLATES[selectedAgentType] && (
+            <div className="spawn-templates">
+              <div className="spawn-templates-label">QUICK START</div>
+              <div className="spawn-templates-grid">
+                {AGENT_TEMPLATES[selectedAgentType].map((tmpl, i) => (
+                  <button
+                    key={i}
+                    className="spawn-template-btn"
+                    onClick={() => {
+                      setPrompt(tmpl.prompt);
+                      inputRef.current?.focus();
+                    }}
+                  >
+                    {tmpl.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Task textarea */}
           <label className="spawn-label">Task</label>

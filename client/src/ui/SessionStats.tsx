@@ -11,10 +11,12 @@ interface Stats {
 }
 
 interface Props {
-  liveAgentCount: number;
+  sessionCount: number;
+  agentCount: number;
+  workingCount: number;
 }
 
-export function SessionStats({ liveAgentCount }: Props) {
+export function SessionStats({ sessionCount, agentCount, workingCount }: Props) {
   const [stats, setStats] = useState<Stats | null>(null);
 
   useEffect(() => {
@@ -35,22 +37,29 @@ export function SessionStats({ liveAgentCount }: Props) {
     return () => clearInterval(interval);
   }, []);
 
-  const activeCount = liveAgentCount || stats?.activeAgents || 0;
-  const totalSessions = stats?.totalSessions || 0;
+  const visibleSessions = sessionCount || stats?.totalSessions || 0;
+  const visibleAgents = agentCount || stats?.activeAgents || 0;
   const totalTokens = stats?.totalTokens || 0;
   const cost = stats?.estimatedCost || 0;
 
   return (
     <div className="session-stats">
-      <div className="stat-item" title="Active agents / Total sessions">
+      <div className="stat-item" title="Visible agents / active sessions">
         <span className="stat-value">
-          <span className={`stat-active ${activeCount > 0 ? "live" : ""}`}>
-            {activeCount}
+          <span className={`stat-active ${visibleAgents > 0 ? "live" : ""}`}>
+            {visibleAgents}
           </span>
           <span className="stat-sep">/</span>
-          <span className="stat-total">{totalSessions}</span>
+          <span className="stat-total">{visibleSessions}</span>
         </span>
-        <span className="stat-label">sessions</span>
+        <span className="stat-label">agents / sessions</span>
+      </div>
+      <div className="stat-divider" />
+      <div className="stat-item" title="Currently working sessions and subagents">
+        <span className={`stat-value ${workingCount > 0 ? "stat-live-work" : ""}`}>
+          {workingCount}
+        </span>
+        <span className="stat-label">working</span>
       </div>
       <div className="stat-divider" />
       <div className="stat-item" title={`~${formatTokens(totalTokens, 1)} tokens total, ~$${cost.toFixed(2)} estimated cost`}>

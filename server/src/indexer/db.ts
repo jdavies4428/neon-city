@@ -87,6 +87,28 @@ function initSchema(db: Database.Database) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_file_changes_session ON file_changes(session_id);
+
+    CREATE TABLE IF NOT EXISTS events (
+      id TEXT PRIMARY KEY,
+      timestamp INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      session_id TEXT,
+      agent_id TEXT,
+      agent_kind TEXT,
+      agent_type TEXT,
+      project_path TEXT,
+      project_name TEXT,
+      tool_name TEXT,
+      tool_use_id TEXT,
+      status TEXT,
+      reason TEXT,
+      payload_json TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+    CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+    CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_path);
   `);
 
   // FTS5 virtual table for full-text search across messages
