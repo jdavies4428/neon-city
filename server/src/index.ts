@@ -3,12 +3,33 @@ import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { spawn, type ChildProcess } from "child_process";
 import { readdir, readFile, stat } from "fs/promises";
-import { join, basename, dirname, resolve, extname } from "path";
+import { join, basename, dirname } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
 import { createReadStream, existsSync, statSync, readdirSync, mkdirSync } from "fs";
 import { createInterface } from "readline";
 import { Indexer } from "./indexer/indexer.js";
+import type {
+  AgentState,
+  ChatMessage,
+  DiscoveredSession,
+  Notification,
+  ToolActivity,
+  WeatherInfo,
+  WeatherState,
+} from "./types.js";
+import { RuntimeState } from "./services/runtime-state.js";
+import { SessionService } from "./services/session-service.js";
+import { EventService } from "./services/event-service.js";
+import { WeatherService } from "./services/weather-service.js";
+import { registerChatRoutes } from "./routes/chat.js";
+import { registerSessionRoutes } from "./routes/sessions.js";
+import { registerHistoryRoutes } from "./routes/history.js";
+import { registerProjectRoutes } from "./routes/projects.js";
+import { registerGitRoutes } from "./routes/git.js";
+import { registerSpawnRoutes } from "./routes/spawn.js";
+import { registerWeatherRoutes } from "./routes/weather.js";
+import { registerEventRoutes } from "./routes/events.js";
 
 const app = express();
 const server = createServer(app);
@@ -16,46 +37,17 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 
 app.use(express.json());
 
+const DATA_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "data");
+mkdirSync(DATA_DIR, { recursive: true });
+const indexer = new Indexer(DATA_DIR);
+const runtime = new RuntimeState();
+const sessionService = new SessionService(indexer, runtime);
+const eventService = new EventService(DATA_DIR, runtime, sessionService);
+const weatherService = new WeatherService(runtime);
+
 // ============================================================
 // State
 // ============================================================
-
-interface AgentState {
-  agentId: string;
-  displayName: string;
-  source: "claude" | "cursor";
-  isThinking: boolean;
-  currentCommand?: string;
-  toolInput?: string;
-  lastActivity: number;
-  status: "idle" | "reading" | "writing" | "thinking" | "stuck" | "walking";
-  waitingForApproval: boolean;
-  agentKind: "session" | "subagent";   // session = IDE/terminal, subagent = spawned
-  agentType?: string;                   // "frontend-developer", "debugger", etc.
-  spawnId?: string;                     // links back to spawn process
-}
-
-interface Notification {
-  id: string;
-  type: "approval-needed" | "task-complete" | "error" | "info";
-  agentId: string;
-  agentName: string;
-  toolName?: string;
-  description: string;
-  timestamp: number;
-  resolved: boolean;
-}
-
-interface ChatMessage {
-  id: string;
-  role: "user" | "assistant" | "system";
-  content: string;
-  agentId?: string;
-  agentName?: string;
-  sessionId?: string;
-  sessionLabel?: string;
-  timestamp: number;
-}
 
 /** Clean env for spawning child claude processes — removes nesting prevention vars */
 function cleanEnvForClaude(): NodeJS.ProcessEnv {
@@ -83,62 +75,94 @@ function summarizeToolInput(toolName: string, input: any): string {
   }
 }
 
+/** Summarise a tool's response into a short human-readable string */
+function summarizeToolResponse(toolName: string, response: any): string {
+  if (!response) return "";
+  if (typeof response === "string") return response.slice(0, 120);
+  switch (toolName) {
+    case "Write":
+      return response.success ? "Written successfully" : "Write failed";
+    case "Edit":
+      return response.success ? "Edit applied" : "Edit failed";
+    case "Bash": {
+      const out = response.stdout || response.output || "";
+      const exit = response.exitCode ?? response.exit_code;
+      if (exit !== undefined && exit !== 0) return `Exit code ${exit}`;
+      return typeof out === "string" ? out.trim().slice(0, 100) : "";
+    }
+    case "Grep": {
+      if (Array.isArray(response)) return `${response.length} matches`;
+      if (typeof response === "string") {
+        let count = 1;
+        let idx = -1;
+        while ((idx = response.indexOf("\n", idx + 1)) !== -1) count++;
+        // Don't count trailing newline as an extra line
+        if (response.endsWith("\n")) count--;
+        return `${count} result${count !== 1 ? "s" : ""}`;
+      }
+      return "";
+    }
+    case "Glob": {
+      if (Array.isArray(response)) return `${response.length} files`;
+      return "";
+    }
+    case "Read": {
+      if (!response.content) return "";
+      let count = 1;
+      let idx = -1;
+      const s = response.content;
+      while ((idx = s.indexOf("\n", idx + 1)) !== -1) count++;
+      return `${count} lines`;
+    }
+    default:
+      return "";
+  }
+}
+
+const AGENT_TYPE_NAMES: Record<string, string> = {
+  "frontend-developer": "Frontend Dev",
+  "backend-developer": "Backend Dev",
+  "mobile-developer": "Mobile Dev",
+  "mobile-app-developer": "Mobile App Dev",
+  "ui-designer": "UI Designer",
+  "database-administrator": "DBA",
+  "ai-engineer": "AI Engineer",
+  "security-engineer": "Security Eng",
+  "security-auditor": "Security Auditor",
+  "debugger": "Debugger",
+  "code-reviewer": "Code Reviewer",
+  "data-analyst": "Data Analyst",
+  "seo-specialist": "SEO Specialist",
+  "content-marketer": "Content Marketer",
+  "business-analyst": "Business Analyst",
+  "project-manager": "Project Manager",
+  "multi-agent-coordinator": "Coordinator",
+  "general-purpose": "General",
+  "Explore": "Explorer",
+  "Plan": "Planner",
+};
+
 function agentTypeFriendlyName(agentType: string): string {
-  const map: Record<string, string> = {
-    "frontend-developer": "Frontend Dev",
-    "backend-developer": "Backend Dev",
-    "mobile-developer": "Mobile Dev",
-    "mobile-app-developer": "Mobile App Dev",
-    "ui-designer": "UI Designer",
-    "database-administrator": "DBA",
-    "ai-engineer": "AI Engineer",
-    "security-engineer": "Security Eng",
-    "security-auditor": "Security Auditor",
-    "debugger": "Debugger",
-    "code-reviewer": "Code Reviewer",
-    "data-analyst": "Data Analyst",
-    "seo-specialist": "SEO Specialist",
-    "content-marketer": "Content Marketer",
-    "business-analyst": "Business Analyst",
-    "project-manager": "Project Manager",
-    "multi-agent-coordinator": "Coordinator",
-    "general-purpose": "General",
-    "Explore": "Explorer",
-    "Plan": "Planner",
-  };
-  return map[agentType] || agentType;
+  return AGENT_TYPE_NAMES[agentType] || agentType;
 }
 
-const agents = new Map<string, AgentState>();
-const clients = new Set<WebSocket>();
-const notifications: Notification[] = [];
-const chatHistory: ChatMessage[] = [];
-let notifCounter = 0;
-let chatCounter = 0;
-const sessionToSpawnId = new Map<string, string>(); // JSONL sessionId → spawnId
-// Subagent agent_ids that haven't been linked to a session_id yet (from PreToolUse).
-// When SubagentStart fires, we add the agent_id. When PreToolUse fires with an unknown
-// session_id, we adopt the oldest unlinked subagent instead of creating a duplicate.
-const unlinkedSubagents: string[] = [];
-// Per-agent debounced idle timers — keeps working status visible for minimum duration
-const agentIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const SESSION_END_REASONS: Record<string, string> = {
+  clear: "Session cleared",
+  logout: "User logged out",
+  prompt_input_exit: "User exited",
+  bypass_permissions_disabled: "Bypass permissions disabled",
+};
 
-interface ToolActivity {
-  id: string;
-  toolUseId: string;
-  agentId: string;
-  agentName: string;
-  sessionId: string;
-  toolName: string;
-  toolInput: string;
-  status: "running" | "complete" | "error";
-  startedAt: number;
-  completedAt?: number;
-  error?: string;
-}
-
-const toolActivities = new Map<string, ToolActivity>();
-let toolActivityCounter = 0;
+const agents = runtime.agents;
+const clients = runtime.clients;
+const notifications = runtime.notifications;
+const chatHistory = runtime.chatHistory;
+const sessionToSpawnId = runtime.sessionToSpawnId;
+const unlinkedSubagents = runtime.unlinkedSubagents;
+const toolActivities = runtime.toolActivities;
+const spawnedProcesses = runtime.spawnedProcesses;
+const chatWatchers = runtime.chatWatchers;
+const discoveredSessions = sessionService.discoveredSessions;
 
 // Tool classification sets (shared across hooks and legacy routes)
 const READ_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Search"]);
@@ -150,28 +174,12 @@ const WRITE_TOOLS = new Set(["Write", "Edit", "Bash", "NotebookEdit"]);
 
 /** Clear a pending idle timer for an agent */
 function clearIdleTimer(agentId: string) {
-  clearTimeout(agentIdleTimers.get(agentId));
-  agentIdleTimers.delete(agentId);
+  runtime.clearIdleTimer(agentId);
 }
 
 /** Schedule a debounced idle transition (2s) after a tool completes */
 function scheduleDebouncedIdle(agentId: string) {
-  const agent = agents.get(agentId);
-  if (!agent) return;
-  agent.lastActivity = Date.now();
-  const completedTool = agent.currentCommand;
-  clearIdleTimer(agentId);
-  agentIdleTimers.set(agentId, setTimeout(() => {
-    agentIdleTimers.delete(agentId);
-    const a = agents.get(agentId);
-    if (a && (a.currentCommand === completedTool || !a.currentCommand)) {
-      a.currentCommand = undefined;
-      a.toolInput = undefined;
-      a.status = "idle";
-      a.lastActivity = Date.now();
-      broadcastThrottled("activity", { agent: a });
-    }
-  }, 2000));
+  runtime.scheduleDebouncedIdle(agentId);
 }
 
 /** Push a notification, cap at 200, and broadcast */
@@ -179,46 +187,26 @@ function pushNotification(
   fields: Omit<Notification, "id" | "timestamp" | "resolved">,
   broadcastExtras?: Record<string, unknown>
 ): Notification {
-  const notif: Notification = {
-    ...fields,
-    id: `notif-${++notifCounter}`,
-    timestamp: Date.now(),
-    resolved: false,
-  };
-  notifications.push(notif);
-  if (notifications.length > 200) notifications.splice(0, notifications.length - 200);
-  broadcast("notification", broadcastExtras ? { ...notif, ...broadcastExtras } : notif);
-  return notif;
+  return runtime.pushNotification(fields, broadcastExtras);
 }
 
 /** Push a chat message, cap at 500, and broadcast */
 function pushChatMessage(msg: ChatMessage) {
-  chatHistory.push(msg);
-  if (chatHistory.length > 500) chatHistory.splice(0, chatHistory.length - 500);
-  broadcast("chat-message", msg);
+  runtime.pushChatMessage(msg);
+}
+
+function recordEvent(input: Parameters<typeof eventService.ingest>[0]) {
+  try {
+    eventService.ingest(input);
+  } catch (err) {
+    console.error("[events] ingest failed:", err);
+  }
 }
 
 /** Resolve an agent's display name with fallback */
 function agentDisplayName(agentId: string | undefined, fallback = "Claude"): string {
-  return agents.get(agentId || "")?.displayName || fallback;
+  return runtime.agentDisplayName(agentId, fallback);
 }
-
-// ============================================================
-// Session Discovery
-// ============================================================
-
-interface DiscoveredSession {
-  sessionId: string;
-  pid: number;
-  workspaceFolders: string[];
-  ideName: string; // "Cursor", "VSCode", "Terminal"
-  projectName: string;
-  projectPath: string;
-  title: string | null;
-  lastActivity: number;
-}
-
-const discoveredSessions = new Map<string, DiscoveredSession>();
 
 // ============================================================
 // WebSocket
@@ -256,9 +244,9 @@ wss.on("connection", (ws) => {
         agents: Array.from(agents.values()),
         notifications: notifications.filter((n) => !n.resolved).slice(-50),
         chatHistory: chatHistory.slice(-100),
-        weather: currentWeather,
+        weather: weatherService.getCurrentWeather(),
         toolActivities: Array.from(toolActivities.values())
-          .filter((a) => Date.now() - a.startedAt < 300_000)
+          .filter((a) => Date.now() - a.startedAt < 1_800_000)
           .slice(-30),
         stats: initStats,
       },
@@ -270,35 +258,11 @@ wss.on("connection", (ws) => {
 });
 
 function broadcast(type: string, data: unknown) {
-  const msg = JSON.stringify({ type, data });
-  for (const ws of clients) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(msg);
-    }
-  }
+  runtime.broadcast(type, data);
 }
 
-// Throttled broadcast for high-frequency events (activity, thinking).
-// Batches messages per type and flushes at ~15fps.
-const pendingBroadcasts = new Map<string, unknown>();
-let broadcastTimer: ReturnType<typeof setInterval> | null = null;
-
 function broadcastThrottled(type: string, data: unknown) {
-  pendingBroadcasts.set(type, data);
-
-  if (!broadcastTimer) {
-    broadcastTimer = setInterval(() => {
-      if (pendingBroadcasts.size === 0) {
-        clearInterval(broadcastTimer!);
-        broadcastTimer = null;
-        return;
-      }
-      for (const [t, d] of pendingBroadcasts) {
-        broadcast(t, d);
-      }
-      pendingBroadcasts.clear();
-    }, 66); // ~15fps
-  }
+  runtime.broadcastThrottled(type, data);
 }
 
 // ============================================================
@@ -473,12 +437,21 @@ interface ApprovalRequest {
   agentName: string;
   toolName: string;
   toolInput: string;
+  rawToolInput?: unknown;
+  projectPath?: string;
+  projectName?: string;
+  source: "api" | "hook";
   status: "pending" | "approved" | "denied";
   createdAt: number;
 }
 
 const approvalRequests = new Map<string, ApprovalRequest>();
-const approvalResolvers = new Map<string, (decision: string, updatedInput?: any) => void>();
+const approvalResolvers = new Map<string, (decision: {
+  decision: string;
+  updatedInput?: unknown;
+  updatedPermissions?: unknown;
+  message?: string;
+}) => void>();
 const autoApproveTools = new Set<string>();
 let approvalCounter = 0;
 
@@ -513,6 +486,8 @@ app.post("/api/approval/request", (req, res) => {
     agentName,
     toolName,
     toolInput: toolInput || "",
+    rawToolInput: toolInput,
+    source: "api",
     status: "pending",
     createdAt: Date.now(),
   };
@@ -530,15 +505,28 @@ app.post("/api/approval/request", (req, res) => {
   res.json({ id, status: "pending" });
 });
 
+app.get("/api/approval/:id", (req, res) => {
+  const request = approvalRequests.get(req.params.id);
+  if (!request) return res.status(404).json({ error: "not found" });
+  res.json({ request });
+});
+
 app.post("/api/approval/:id/decide", (req, res) => {
   const { id } = req.params;
-  const { decision } = req.body;
+  const { decision, updatedInput, updatedPermissions, message, approveAll } = req.body;
 
   // Check if this is a hooks-based approval (PermissionRequest hook)
   const resolver = approvalResolvers.get(id);
   if (resolver) {
-    resolver(decision, req.body.updatedInput);
-    res.json({ ok: true, id, decision });
+    const request = approvalRequests.get(id);
+    if (request && request.status === "pending") {
+      request.status = decision === "approve" ? "approved" : "denied";
+      if (approveAll && decision === "approve") {
+        autoApproveTools.add(request.toolName);
+      }
+    }
+    resolver({ decision, updatedInput, updatedPermissions, message });
+    res.json({ ok: true, id, decision, updatedInput, updatedPermissions });
     return;
   }
 
@@ -548,7 +536,6 @@ app.post("/api/approval/:id/decide", (req, res) => {
     return res.json({ id: request.id, status: request.status });
   }
 
-  const { approveAll } = req.body;
   request.status = decision === "approve" ? "approved" : "denied";
 
   if (approveAll && decision === "approve") {
@@ -614,14 +601,16 @@ app.get("/api/approval/:id/wait", (req, res) => {
 
 // Hook 1: Session Start
 app.post("/api/hooks/session-start", (req, res) => {
-  const { session_id, cwd } = req.body;
-  const projectName = friendlyProjectName(cwd || "unknown");
+  const { session_id, cwd, model, source } = req.body;
+  const projectName = sessionService.friendlyProjectName(cwd || "unknown");
   const agentId = `session-${session_id}`;
 
   // Idempotent: update if exists
   const existing = agents.get(agentId);
   if (existing) {
     existing.lastActivity = Date.now();
+    if (model) existing.model = model;
+    if (source) existing.sessionSource = source;
     broadcast("activity", { agent: existing });
     res.json({});
     return;
@@ -647,8 +636,22 @@ app.post("/api/hooks/session-start", (req, res) => {
     status: "idle",
     waitingForApproval: false,
     agentKind: "session",
+    model,
+    sessionSource: source,
   };
   agents.set(agentId, newAgent);
+
+  recordEvent({
+    eventType: "SessionStart",
+    sessionId: session_id,
+    agentId,
+    agentKind: "session",
+    projectPath: cwd || undefined,
+    projectName,
+    status: "idle",
+    reason: typeof source === "string" ? source : undefined,
+    payload: { cwd, model, source },
+  });
 
   broadcast("activity", { agent: newAgent });
   res.json({});
@@ -656,12 +659,39 @@ app.post("/api/hooks/session-start", (req, res) => {
 
 // Hook 2: Session End
 app.post("/api/hooks/session-end", (req, res) => {
-  const { session_id } = req.body;
+  const { session_id, reason } = req.body;
   const agentId = findAgentBySessionId(session_id) || `session-${session_id}`;
+  const agentName = agentDisplayName(agentId);
+  const discovered = discoveredSessions.get(`hook-${session_id}`);
+
+  // Create a system message for session end with context
+  // Must happen before agents.delete so agentDisplayName can still resolve
+  if (reason && reason !== "other") {
+    pushChatMessage({
+      id: runtime.nextChatMessageId(),
+      role: "system",
+      content: SESSION_END_REASONS[reason] || `Session ended: ${reason}`,
+      agentName,
+      sessionId: session_id,
+      timestamp: Date.now(),
+    });
+  }
 
   agents.delete(agentId);
   discoveredSessions.delete(`hook-${session_id}`);
   clearIdleTimer(agentId);
+
+  recordEvent({
+    eventType: "SessionEnd",
+    sessionId: session_id,
+    agentId,
+    agentKind: "session",
+    projectPath: discovered?.projectPath,
+    projectName: discovered?.projectName,
+    status: "idle",
+    reason: typeof reason === "string" ? reason : undefined,
+    payload: { reason, agentName },
+  });
 
   // Stop any JSONL watcher for this session
   const watcher = chatWatchers.get(session_id);
@@ -690,7 +720,7 @@ app.post("/api/hooks/pre-tool-use", (req, res) => {
       sessionToSpawnId.set(session_id, unlinkedId);
     } else {
       agentId = `session-${session_id}`;
-      const projectName = cwd ? friendlyProjectName(cwd) : "Claude";
+      const projectName = cwd ? sessionService.friendlyProjectName(cwd) : "Claude";
       agents.set(agentId, {
         agentId,
         displayName: projectName,
@@ -725,7 +755,7 @@ app.post("/api/hooks/pre-tool-use", (req, res) => {
   agent.isThinking = false;
 
   // Track tool activity
-  const activityId = `tool-${++toolActivityCounter}`;
+  const activityId = runtime.nextToolActivityId();
   toolActivities.set(tool_use_id, {
     id: activityId,
     toolUseId: tool_use_id,
@@ -748,6 +778,19 @@ app.post("/api/hooks/pre-tool-use", (req, res) => {
   }
 
   // Immediate broadcast (not throttled) — tool-start is high-signal
+  recordEvent({
+    eventType: "PreToolUse",
+    sessionId: session_id,
+    agentId,
+    agentKind: agent.agentKind,
+    agentType: agent.agentType,
+    projectPath: cwd || undefined,
+    projectName: cwd ? sessionService.friendlyProjectName(cwd) : undefined,
+    toolName: tool_name,
+    toolUseId: tool_use_id,
+    status: agent.status,
+    payload: { toolInput: tool_input, summarizedInput: agent.toolInput },
+  });
   broadcast("activity", { agent });
   broadcast("tool-activity", toolActivities.get(tool_use_id));
   res.json({});
@@ -755,18 +798,36 @@ app.post("/api/hooks/pre-tool-use", (req, res) => {
 
 // Hook 4: Post Tool Use
 app.post("/api/hooks/post-tool-use", (req, res) => {
-  const { session_id, tool_use_id } = req.body;
+  const { session_id, tool_use_id, tool_name, tool_response } = req.body;
   const agentId = findAgentBySessionId(session_id);
+  const agent = agentId ? agents.get(agentId) : undefined;
 
   // Update tool activity
   const activity = toolActivities.get(tool_use_id);
   if (activity) {
     activity.status = "complete";
     activity.completedAt = Date.now();
+    // Summarize the tool response for the activity feed
+    if (tool_response) {
+      activity.responseSummary = summarizeToolResponse(tool_name, tool_response);
+    }
     broadcast("tool-activity", activity);
   }
 
   // Debounced idle transition (2s)
+  recordEvent({
+    eventType: "PostToolUse",
+    sessionId: session_id,
+    agentId: agentId || undefined,
+    agentKind: agent?.agentKind,
+    agentType: agent?.agentType,
+    projectPath: session_id ? discoveredSessions.get(`hook-${session_id}`)?.projectPath : undefined,
+    projectName: session_id ? discoveredSessions.get(`hook-${session_id}`)?.projectName : undefined,
+    toolName: tool_name,
+    toolUseId: tool_use_id,
+    status: "complete",
+    payload: { toolResponse: tool_response, responseSummary: activity?.responseSummary },
+  });
   if (agentId) scheduleDebouncedIdle(agentId);
 
   res.json({});
@@ -774,8 +835,9 @@ app.post("/api/hooks/post-tool-use", (req, res) => {
 
 // Hook 5: Post Tool Use Failure
 app.post("/api/hooks/post-tool-use-failure", (req, res) => {
-  const { session_id, tool_name, tool_use_id, error } = req.body;
+  const { session_id, tool_name, tool_use_id, error, is_interrupt } = req.body;
   const agentId = findAgentBySessionId(session_id);
+  const agent = agentId ? agents.get(agentId) : undefined;
   // Update tool activity
   const activity = toolActivities.get(tool_use_id);
   if (activity) {
@@ -786,23 +848,162 @@ app.post("/api/hooks/post-tool-use-failure", (req, res) => {
   }
 
   // Create error notification
+  const errorMsg = typeof error === "string" ? error : "Unknown error";
+  const prefix = is_interrupt ? "Interrupted" : `${tool_name} failed`;
   pushNotification({
     type: "error",
     agentId: agentId || session_id,
     agentName: agentDisplayName(agentId),
     toolName: tool_name,
-    description: `${tool_name} failed: ${(typeof error === "string" ? error : "Unknown error").slice(0, 200)}`,
+    description: `${prefix}: ${errorMsg.slice(0, 200)}`,
   });
 
   // Debounced idle transition (same as post-tool-use)
+  recordEvent({
+    eventType: "PostToolUseFailure",
+    sessionId: session_id,
+    agentId: agentId || undefined,
+    agentKind: agent?.agentKind,
+    agentType: agent?.agentType,
+    projectPath: session_id ? discoveredSessions.get(`hook-${session_id}`)?.projectPath : undefined,
+    projectName: session_id ? discoveredSessions.get(`hook-${session_id}`)?.projectName : undefined,
+    toolName: tool_name,
+    toolUseId: tool_use_id,
+    status: is_interrupt ? "interrupted" : "error",
+    reason: errorMsg,
+    payload: { error, isInterrupt: !!is_interrupt },
+  });
   if (agentId) scheduleDebouncedIdle(agentId);
 
   res.json({});
 });
 
-// Hook 6: PermissionRequest intentionally excluded from setup.js — it blocks tool
-// execution until the Neon City UI approves, which deadlocks if the UI is unavailable.
-// The endpoint is removed to avoid dead code. Re-add if an opt-in mechanism is built.
+// Hook 6: Permission Request (holds connection open until UI approves/denies)
+app.post("/api/hooks/permission-request", (req, res) => {
+  const { session_id, tool_name, tool_input } = req.body;
+  const agentId = findAgentBySessionId(session_id) || `session-${session_id}`;
+
+  // Auto-approve if user previously clicked "Approve All" for this tool
+  if (autoApproveTools.has(tool_name)) {
+    return res.json({
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "allow" },
+      },
+    });
+  }
+
+  const inputSummary = summarizeToolInput(tool_name, tool_input || {});
+  const agent = agents.get(agentId);
+
+  // Set agent to stuck/waiting state
+  if (agent) {
+    agent.status = "stuck";
+    agent.waitingForApproval = true;
+    agent.currentCommand = tool_name;
+    agent.toolInput = inputSummary;
+    agent.lastActivity = Date.now();
+    broadcast("activity", { agent });
+  }
+
+  // Create approval notification
+  const approvalId = `hook-approval-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const projectPath = discoveredSessions.get(`hook-${session_id}`)?.projectPath;
+  const projectName = discoveredSessions.get(`hook-${session_id}`)?.projectName;
+  const notif = pushNotification({
+    type: "approval-needed",
+    agentId,
+    agentName: agentDisplayName(agentId),
+    toolName: tool_name,
+    description: `${tool_name}: ${inputSummary}`,
+    approvalId,
+  });
+
+  recordEvent({
+    eventType: "PermissionRequest",
+    sessionId: session_id,
+    agentId,
+    agentKind: agent?.agentKind ?? "session",
+    agentType: agent?.agentType,
+    projectPath,
+    projectName,
+    toolName: tool_name,
+    status: "pending",
+    reason: inputSummary,
+    payload: { toolInput: tool_input, approvalId, notificationId: notif.id },
+  });
+
+  approvalRequests.set(approvalId, {
+    id: approvalId,
+    agentId,
+    agentName: agentDisplayName(agentId),
+    toolName: tool_name,
+    toolInput: inputSummary,
+    rawToolInput: tool_input,
+    projectPath,
+    projectName,
+    source: "hook",
+    status: "pending",
+    createdAt: Date.now(),
+  });
+
+  // Hold connection open — resolve when user clicks Approve/Deny
+  const timeout = setTimeout(() => {
+    cleanup();
+    if (!res.headersSent) {
+      res.json({
+        hookSpecificOutput: {
+          hookEventName: "PermissionRequest",
+          decision: { behavior: "deny", message: "Neon City approval timed out" },
+        },
+      });
+    }
+  }, 120_000);
+
+  function cleanup() {
+    clearTimeout(timeout);
+    approvalResolvers.delete(approvalId);
+    // Resolve the notification
+    if (notif && !notif.resolved) {
+      notif.resolved = true;
+      broadcast("notification-resolved", { id: notif.id });
+    }
+    const a = agents.get(agentId);
+    if (a) {
+      a.waitingForApproval = false;
+      a.status = "idle";
+      broadcast("activity", { agent: a });
+    }
+  }
+
+  approvalResolvers.set(approvalId, ({ decision, updatedInput, updatedPermissions, message }) => {
+    cleanup();
+    if (res.headersSent) return;
+
+    if (decision === "approve" || decision === "allow") {
+      res.json({
+        hookSpecificOutput: {
+          hookEventName: "PermissionRequest",
+          decision: {
+            behavior: "allow",
+            ...(updatedInput ? { updatedInput } : {}),
+            ...(updatedPermissions ? { updatedPermissions } : {}),
+          },
+        },
+      });
+    } else {
+      res.json({
+        hookSpecificOutput: {
+          hookEventName: "PermissionRequest",
+          decision: { behavior: "deny", message: message || "Denied via Neon City UI" },
+        },
+      });
+    }
+  });
+
+  // Cleanup if client disconnects (idempotent — safe to call even if already cleaned up)
+  req.on("close", () => cleanup());
+});
 
 // Hook 7: Subagent Start
 app.post("/api/hooks/subagent-start", (req, res) => {
@@ -822,6 +1023,15 @@ app.post("/api/hooks/subagent-start", (req, res) => {
     agentType: agent_type,
   };
   agents.set(agentId, newAgent);
+
+  recordEvent({
+    eventType: "SubagentStart",
+    agentId,
+    agentKind: "subagent",
+    agentType: agent_type,
+    status: "walking",
+    payload: { agentType: agent_type },
+  });
 
   // Track as unlinked — will be adopted when PreToolUse fires with its session_id
   unlinkedSubagents.push(agentId);
@@ -845,6 +1055,15 @@ app.post("/api/hooks/subagent-stop", (req, res) => {
   });
 
   // Remove agent and clean up mappings
+  recordEvent({
+    eventType: "SubagentStop",
+    agentId: agentId || undefined,
+    agentKind: "subagent",
+    agentType: agent_type,
+    status: "complete",
+    reason: typeof last_assistant_message === "string" ? last_assistant_message.slice(0, 200) : "Agent completed its task",
+    payload: { lastAssistantMessage: last_assistant_message },
+  });
   agents.delete(agentId);
   clearIdleTimer(agentId);
   const unlinkedIdx = unlinkedSubagents.indexOf(agentId);
@@ -876,7 +1095,7 @@ app.post("/api/hooks/stop", (req, res) => {
   // Add assistant's final message to chat
   if (last_assistant_message && typeof last_assistant_message === "string") {
     pushChatMessage({
-      id: `msg-${++chatCounter}`,
+      id: runtime.nextChatMessageId(),
       role: "assistant",
       content: last_assistant_message,
       agentName: agentDisplayName(agentId),
@@ -915,7 +1134,7 @@ app.post("/api/hooks/user-prompt-submit", (req, res) => {
     }
     if (!isDupe) {
       pushChatMessage({
-        id: `msg-${++chatCounter}`,
+        id: runtime.nextChatMessageId(),
         role: "user",
         content: prompt,
         sessionId: session_id,
@@ -943,500 +1162,25 @@ app.post("/api/hooks/notification", (req, res) => {
   res.json({});
 });
 
-// ============================================================
-// Routes — Chat / Messaging
-// ============================================================
+const routeContext = {
+  indexer,
+  runtime,
+  sessionService,
+  eventService,
+  weatherService,
+  cleanEnvForClaude,
+  agentTypeFriendlyName,
+};
 
-/** Extract first user message from a session JSONL to use as title */
-// getSessionTitle removed — replaced by indexer.getSessionTitle() (fast SQLite lookup)
-
-// Persistent chat session for Neon City chat panel (reuses same session across messages)
-let neonChatSessionId: string | null = null;
-const projectLabel = friendlyProjectName(process.cwd());
-
-app.post("/api/chat/send", async (req, res) => {
-  const { message, sessionId } = req.body;
-  if (!message) return res.status(400).json({ error: "message required" });
-
-  // Resolve which session to use
-  const targetSessionId = sessionId || neonChatSessionId;
-
-  // Resolve session label and project path from discovered sessions
-  const agent = targetSessionId ? agents.get(targetSessionId) : undefined;
-  const project = targetSessionId ? findSessionProject(targetSessionId) : null;
-
-  // Find the discovered session entry to get the correct projectPath for cwd
-  let discoveredProjectPath: string | null = null;
-  if (targetSessionId) {
-    for (const [, ds] of discoveredSessions) {
-      if (ds.sessionId === targetSessionId && ds.projectPath) {
-        discoveredProjectPath = ds.projectPath;
-        break;
-      }
-    }
-  }
-
-  const sessionLabel = targetSessionId
-    ? (agent ? `${agent.displayName}` : "Claude") + (project ? ` — ${project.projectName}` : "")
-    : `Neon City — ${projectLabel}`;
-
-  // Record user message
-  const userMsg: ChatMessage = {
-    id: `msg-${++chatCounter}`,
-    role: "user",
-    content: message,
-    sessionId: targetSessionId || "neon-chat",
-    sessionLabel,
-    timestamp: Date.now(),
-  };
-  pushChatMessage(userMsg);
-
-  // Build args — use --resume to continue existing session, -p for print mode
-  const args: string[] = [];
-  if (targetSessionId) {
-    args.push("--resume", targetSessionId);
-  }
-  args.push("-p", message);
-
-  // Use the session's project path as cwd so claude can find the session file
-  const spawnCwd = discoveredProjectPath && existsSync(discoveredProjectPath)
-    ? discoveredProjectPath
-    : (project?.projectPath && existsSync(project.projectPath) ? project.projectPath : undefined);
-
-  try {
-    const child = spawn("claude", args, {
-      cwd: spawnCwd || undefined,
-      env: cleanEnvForClaude(),
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-    });
-
-    // Track stderr for error detection
-    let stderr = "";
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-
-    // Capture stdout for response
-    let stdout = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-
-    child.on("close", (code) => {
-      if (code && code !== 0 && stderr) {
-        console.error(`[chat] claude exited ${code}: ${stderr.slice(0, 200)}`);
-      }
-
-      const content = stdout.trim() || stderr.trim() || `(exited with code ${code})`;
-      // Only broadcast stdout response if we DON'T have a chat watcher picking it up
-      if (!targetSessionId || !chatWatchers.has(targetSessionId)) {
-        pushChatMessage({
-          id: `msg-${++chatCounter}`,
-          role: "assistant",
-          content,
-          agentName: agent?.displayName || "Claude",
-          sessionId: targetSessionId || "neon-chat",
-          sessionLabel,
-          timestamp: Date.now(),
-        });
-      }
-    });
-
-    // Give it 2 seconds to fail fast (voice-mode pattern)
-    setTimeout(() => {
-      if (child.exitCode !== null && child.exitCode !== 0) {
-        pushChatMessage({
-          id: `msg-${++chatCounter}`,
-          role: "assistant",
-          content: `(Error: ${stderr.trim() || "claude exited with code " + child.exitCode})`,
-          agentName: "Claude",
-          sessionId: targetSessionId || "neon-chat",
-          sessionLabel,
-          timestamp: Date.now(),
-        });
-      }
-    }, 2000);
-
-    child.unref();
-    res.json({ ok: true, id: userMsg.id, mode: targetSessionId ? "session" : "chat" });
-  } catch (err: any) {
-    console.error("[chat] spawn error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/chat/history", (_req, res) => {
-  res.json({ messages: chatHistory.slice(-100) });
-});
-
-// ============================================================
-// Routes — Session Discovery
-// ============================================================
-
-app.get("/api/sessions", async (_req, res) => {
-  try {
-    const claudeDir = join(homedir(), ".claude", "projects");
-    const sessions: Array<{
-      projectPath: string;
-      projectName: string;
-      sessionFiles: string[];
-    }> = [];
-
-    let projectDirs: string[] = [];
-    try {
-      projectDirs = await readdir(claudeDir);
-    } catch {
-      return res.json({ sessions: [] });
-    }
-
-    for (const dir of projectDirs.slice(0, 20)) {
-      const projectPath = join(claudeDir, dir);
-      const st = await stat(projectPath).catch(() => null);
-      if (!st?.isDirectory()) continue;
-
-      // Look for session JSONL files
-      const files = await readdir(projectPath).catch(() => [] as string[]);
-      const jsonlFiles = files.filter((f) => f.endsWith(".jsonl"));
-
-      if (jsonlFiles.length > 0) {
-        // Decode the project name from the directory name
-        const projectName = decodeProjectDir(dir);
-        sessions.push({
-          projectPath: projectName,
-          projectName: basename(projectName),
-          sessionFiles: jsonlFiles.slice(0, 10),
-        });
-      }
-    }
-
-    res.json({ sessions });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-function decodeProjectDir(dirName: string): string {
-  // Claude encodes project paths by replacing / with -
-  // e.g., "-Users-jeff-myproject" → "/Users/jeff/myproject"
-  return dirName.replace(/^-/, "/").replace(/-/g, "/");
-}
-
-/** Friendly project name from full path — last 2 segments for context */
-function friendlyProjectName(fullPath: string): string {
-  const parts = fullPath.split("/").filter(Boolean);
-  // Skip home dir prefix, take last 1-2 meaningful segments
-  const meaningful = parts.filter((p) => p !== "Users" && p !== homedir().split("/").pop());
-  if (meaningful.length <= 1) return meaningful[0] || basename(fullPath);
-  return meaningful.slice(-2).join("/");
-}
-
-/** Find which project a session file belongs to (returns project name or null).
- *  Results are cached to avoid repeated sync filesystem scans. */
-const sessionProjectCache = new Map<string, { projectName: string; projectPath: string } | null>();
-let sessionProjectCacheTime = 0;
-
-function findSessionProject(sessionId: string): { projectName: string; projectPath: string } | null {
-  // Rebuild cache every 30s
-  const now = Date.now();
-  if (now - sessionProjectCacheTime > 30_000) {
-    sessionProjectCache.clear();
-    sessionProjectCacheTime = now;
-  }
-
-  if (sessionProjectCache.has(sessionId)) {
-    return sessionProjectCache.get(sessionId)!;
-  }
-
-  const claudeProjects = join(homedir(), ".claude", "projects");
-  if (!existsSync(claudeProjects)) { sessionProjectCache.set(sessionId, null); return null; }
-
-  try {
-    const projectDirs = readdirSync(claudeProjects);
-    for (const dir of projectDirs) {
-      const sessionFile = join(claudeProjects, dir, `${sessionId}.jsonl`);
-      if (existsSync(sessionFile)) {
-        const decoded = decodeProjectDir(dir);
-        const result = { projectName: friendlyProjectName(decoded), projectPath: decoded };
-        sessionProjectCache.set(sessionId, result);
-        return result;
-      }
-    }
-  } catch {
-    // Ignore
-  }
-  sessionProjectCache.set(sessionId, null);
-  return null;
-}
-
-// Session color palette for distinguishing sessions in chat
-const SESSION_COLORS = [
-  "#00f0ff", // cyan
-  "#ff6bcb", // pink
-  "#39ff14", // green
-  "#ffaa00", // orange
-  "#b388ff", // purple
-  "#ff5252", // red
-  "#64ffda", // teal
-  "#ffd740", // yellow
-];
-const sessionColorMap = new Map<string, string>();
-function getSessionColor(sessionId: string): string {
-  let color = sessionColorMap.get(sessionId);
-  if (!color) {
-    color = SESSION_COLORS[sessionColorMap.size % SESSION_COLORS.length];
-    sessionColorMap.set(sessionId, color);
-  }
-  return color;
-}
-
-/**
- * Active sessions = hook-registered agents (live) + recent session files (last 24h).
- * Each session gets a label like "Claude 1 — myproject" and a color.
- */
-
-// Cache for expensive recent-session filesystem scan (statSync per .jsonl file)
-let recentSessionsCache: Array<{
-  sessionId: string; label: string; agentName: string; projectName: string;
-  projectPath: string; status: string; lastActivity: number; color: string;
-  isLive: boolean; ideName: string;
-}> = [];
-let recentSessionsCacheTime = 0;
-const RECENT_SESSIONS_CACHE_TTL = 10_000; // 10s
-
-async function getRecentSessions(seenSessionIds: Set<string>) {
-  const now = Date.now();
-  if (now - recentSessionsCacheTime < RECENT_SESSIONS_CACHE_TTL && recentSessionsCache.length > 0) {
-    return recentSessionsCache.filter(s => !seenSessionIds.has(s.sessionId));
-  }
-
-  const results: typeof recentSessionsCache = [];
-  const claudeProjects = join(homedir(), ".claude", "projects");
-  try { await stat(claudeProjects); } catch { recentSessionsCache = []; recentSessionsCacheTime = now; return []; }
-
-  const cutoff = now - 24 * 60 * 60 * 1000;
-  const projectDirs = await readdir(claudeProjects);
-
-  for (const dir of projectDirs.slice(0, 20)) {
-    const projectPath = join(claudeProjects, dir);
-    try {
-      const st = await stat(projectPath);
-      if (!st.isDirectory()) continue;
-
-      const dirFiles = await readdir(projectPath);
-      const jsonlNames = dirFiles.filter((f) => f.endsWith(".jsonl"));
-      const files: Array<{ name: string; sessionId: string; mtime: number }> = [];
-      for (const f of jsonlNames) {
-        try {
-          const fst = await stat(join(projectPath, f));
-          if (fst.mtimeMs > cutoff) {
-            files.push({ name: f, sessionId: f.replace(".jsonl", ""), mtime: fst.mtimeMs });
-          }
-        } catch { /* skip */ }
-      }
-      files.sort((a, b) => b.mtime - a.mtime);
-      const top5 = files.slice(0, 5);
-
-      const decoded = decodeProjectDir(dir);
-      const projName = friendlyProjectName(decoded);
-
-      for (const f of top5) {
-        const title = indexer.getSessionTitle(f.sessionId);
-        results.push({
-          sessionId: f.sessionId,
-          label: title ? `${projName}: ${title}` : `Session — ${projName}`,
-          agentName: "Claude",
-          projectName: projName,
-          projectPath: decoded,
-          status: "idle",
-          lastActivity: f.mtime,
-          color: getSessionColor(f.sessionId),
-          isLive: false,
-          ideName: "Recent",
-        });
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  recentSessionsCache = results;
-  recentSessionsCacheTime = now;
-  return results.filter(s => !seenSessionIds.has(s.sessionId));
-}
-
-app.get("/api/sessions/active", async (_req, res) => {
-  try {
-    const activeSessions: Array<{
-      sessionId: string;
-      label: string;
-      agentName: string;
-      projectName: string;
-      projectPath: string;
-      status: string;
-      lastActivity: number;
-      color: string;
-      isLive: boolean;
-      ideName: string;
-    }> = [];
-
-    const seenSessionIds = new Set<string>();
-
-    // 1. Lock-file discovered sessions (highest priority — auto-detected)
-    for (const [, session] of discoveredSessions) {
-      if (seenSessionIds.has(session.sessionId)) continue;
-      seenSessionIds.add(session.sessionId);
-
-      const label = session.title
-        ? `${session.ideName}/${session.projectName}: ${session.title}`
-        : `${session.ideName} — ${session.projectName}`;
-
-      activeSessions.push({
-        sessionId: session.sessionId,
-        label,
-        agentName: `Claude (${session.ideName})`,
-        projectName: session.projectName,
-        projectPath: session.projectPath,
-        status: agents.get(session.sessionId)?.status || "idle",
-        lastActivity: session.lastActivity,
-        color: getSessionColor(session.sessionId),
-        isLive: true,
-        ideName: session.ideName,
-      });
-    }
-
-    // 2. Hook-registered agents (confirmed live, but may overlap with lock files)
-    for (const [id, agent] of agents) {
-      if (seenSessionIds.has(id)) continue;
-      // Skip citizen placeholder agents — they're city decoration, not real sessions
-      if (id.startsWith("citizen-")) continue;
-      seenSessionIds.add(id);
-
-      const project = findSessionProject(id);
-      const label = project
-        ? `${agent.displayName} — ${project.projectName}`
-        : agent.displayName;
-      activeSessions.push({
-        sessionId: id,
-        label,
-        agentName: agent.displayName,
-        projectName: project?.projectName || "unknown",
-        projectPath: project?.projectPath || "",
-        status: agent.status,
-        lastActivity: agent.lastActivity,
-        color: getSessionColor(id),
-        isLive: true,
-        ideName: "Hook",
-      });
-    }
-
-    // 3. Recent session files (last 24h) — cached to avoid expensive statSync per file
-    const recentSessions = await getRecentSessions(seenSessionIds);
-    for (const s of recentSessions) {
-      seenSessionIds.add(s.sessionId);
-      activeSessions.push(s);
-    }
-
-    // Sort: live first, then by last activity
-    activeSessions.sort((a, b) => {
-      if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
-      return b.lastActivity - a.lastActivity;
-    });
-
-    res.json({ sessions: activeSessions });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// Routes — History (indexed sessions, search, plans, todos)
-// ============================================================
-
-const DATA_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "data");
-mkdirSync(DATA_DIR, { recursive: true });
-const indexer = new Indexer(DATA_DIR);
-
-// Defer initial indexing so the server can respond immediately with
-// stale-but-present data from the persisted SQLite database.  The DB
-// survives restarts, so stats/sessions are available from the start.
-// indexAll() is kicked off after a short delay to avoid blocking HTTP/WS.
-setTimeout(() => {
-  indexer.indexAll().then(() => {
-    console.log("[Indexer] Initial indexing complete");
-    indexer.startWatching();
-  });
-}, 2000);
-
-app.get("/api/history/projects", (_req, res) => {
-  try {
-    const projects = indexer.getProjects();
-    res.json({ projects });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/history/sessions", (req, res) => {
-  try {
-    const projectId = req.query.project ? Number(req.query.project) : undefined;
-    const limit = Math.min(Number(req.query.limit) || 50, 200);
-    const offset = Number(req.query.offset) || 0;
-    const sessions = indexer.getSessions(projectId, limit, offset);
-    res.json({ sessions });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/history/sessions/:id", (req, res) => {
-  try {
-    const messages = indexer.getSessionMessages(req.params.id);
-    const fileChanges = indexer.getFileChanges(req.params.id);
-    res.json({ messages, fileChanges });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/history/search", (req, res) => {
-  try {
-    const query = String(req.query.q || "");
-    const limit = Math.min(Number(req.query.limit) || 50, 200);
-    const results = indexer.search(query, limit);
-    res.json({ results, query });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/history/plans", (req, res) => {
-  try {
-    const projectId = req.query.project ? Number(req.query.project) : undefined;
-    const plans = indexer.getPlans(projectId);
-    res.json({ plans });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/history/todos", (_req, res) => {
-  try {
-    const todos = indexer.getTodos();
-    res.json({ todos });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/history/stats", (_req, res) => {
-  try {
-    const stats = indexer.getStats();
-    res.json(stats);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
+app.use("/api/chat", registerChatRoutes(routeContext));
+app.use("/api/sessions", registerSessionRoutes(routeContext));
+app.use("/api/history", registerHistoryRoutes(routeContext));
+app.use("/api/events", registerEventRoutes(routeContext));
+app.use("/api/projects", registerProjectRoutes(routeContext));
+app.use("/api/git", registerGitRoutes(routeContext));
+app.use("/api/spawn", registerSpawnRoutes(routeContext));
+app.use("/api/weather", registerWeatherRoutes(routeContext));
+weatherService.startAutoUpdates();
 
 // ============================================================
 // Routes — Stats (combined live + indexed data)
@@ -1481,299 +1225,6 @@ setInterval(() => {
     // Silent
   }
 }, 10_000);
-
-// ============================================================
-// Routes — All Known Projects
-// ============================================================
-
-app.get("/api/projects", async (_req, res) => {
-  try {
-    const claudeProjects = join(homedir(), ".claude", "projects");
-    try { await stat(claudeProjects); } catch { return res.json({ projects: [] }); }
-
-    const projectDirs = await readdir(claudeProjects);
-    const projects: Array<{ name: string; path: string; lastActivity: number }> = [];
-    const seenPaths = new Set<string>();
-
-    for (const dir of projectDirs) {
-      const fullDir = join(claudeProjects, dir);
-      try {
-        const st = await stat(fullDir);
-        if (!st.isDirectory()) continue;
-
-        const decoded = decodeProjectDir(dir);
-        if (seenPaths.has(decoded)) continue;
-        seenPaths.add(decoded);
-
-        let lastActivity = st.mtimeMs;
-        try {
-          const files = (await readdir(fullDir)).filter((f) => f.endsWith(".jsonl"));
-          for (const f of files) {
-            const fstat = await stat(join(fullDir, f));
-            if (fstat.mtimeMs > lastActivity) lastActivity = fstat.mtimeMs;
-          }
-        } catch { /* ignore */ }
-
-        const name = friendlyProjectName(decoded);
-        projects.push({ name, path: decoded, lastActivity });
-      } catch {
-        continue;
-      }
-    }
-
-    projects.sort((a, b) => b.lastActivity - a.lastActivity);
-    res.json({ projects });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post("/api/projects/create", (req, res) => {
-  const { name } = req.body;
-  if (!name || typeof name !== "string") {
-    return res.status(400).json({ error: "name required" });
-  }
-
-  // Sanitize: only allow alphanumeric, dashes, underscores, dots
-  const safeName = name.trim().replace(/[^a-zA-Z0-9\-_.]/g, "-").replace(/-+/g, "-");
-  if (!safeName) return res.status(400).json({ error: "invalid name" });
-
-  const projectDir = join(homedir(), "Projects", safeName);
-
-  try {
-    if (existsSync(projectDir)) {
-      return res.json({ ok: true, path: projectDir, created: false });
-    }
-    mkdirSync(projectDir, { recursive: true });
-    res.json({ ok: true, path: projectDir, created: true });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/projects/tree", async (req, res) => {
-  const targetPath = req.query.path as string;
-  if (!targetPath) return res.status(400).json({ error: "path required" });
-
-  const resolved = resolve(targetPath);
-
-  try {
-    const st = await stat(resolved);
-    if (!st.isDirectory()) return res.status(400).json({ error: "not a directory" });
-  } catch {
-    return res.status(404).json({ error: "path not found" });
-  }
-
-  const IGNORED = new Set([
-    ".git", "node_modules", ".next", "__pycache__", ".venv", "dist", "build",
-    ".DS_Store", ".cache", ".turbo", ".svelte-kit", "coverage", ".nyc_output",
-  ]);
-  const MAX_ENTRIES = 200;
-
-  try {
-    const dirents = await readdir(resolved, { withFileTypes: true });
-    const entries: Array<{ name: string; path: string; type: "file" | "dir"; size?: number }> = [];
-
-    for (const d of dirents) {
-      if (IGNORED.has(d.name) || d.name.startsWith(".")) continue;
-      if (entries.length >= MAX_ENTRIES) break;
-
-      const fullPath = join(resolved, d.name);
-      const type = d.isDirectory() ? "dir" as const : "file" as const;
-
-      let size: number | undefined;
-      if (type === "file") {
-        try {
-          const fst = await stat(fullPath);
-          size = fst.size;
-        } catch { /* skip */ }
-      }
-
-      entries.push({ name: d.name, path: fullPath, type, size });
-    }
-
-    // Sort: directories first, then files, alphabetical within each group
-    entries.sort((a, b) => {
-      if (a.type !== b.type) return a.type === "dir" ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
-
-    res.json({ entries });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || "failed to read directory" });
-  }
-});
-
-app.get("/api/projects/file", async (req, res) => {
-  const filePath = req.query.path as string;
-  if (!filePath) return res.status(400).json({ error: "path required" });
-
-  const resolved = resolve(filePath);
-  const ext = extname(resolved).toLowerCase();
-
-  // Reject paths inside .git directories
-  if (resolved.includes("/.git/") || resolved.includes("\\.git\\")) {
-    return res.status(403).json({ error: "access denied" });
-  }
-
-  const ALLOWED = new Set([
-    ".md", ".prd", ".txt", ".json", ".yaml", ".yml", ".toml",
-    ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".rs", ".java",
-    ".css", ".html", ".svg", ".sh", ".sql", ".cfg", ".ini",
-    ".gitignore", ".editorconfig", ".env.example",
-  ]);
-
-  // Also allow files with no extension that are common config files
-  const base = basename(resolved);
-  const isAllowedNoExt = ["Makefile", "Dockerfile", "Procfile", "LICENSE", "Gemfile", "Rakefile"].includes(base);
-
-  if (!ALLOWED.has(ext) && !isAllowedNoExt) {
-    return res.status(403).json({ error: `file type '${ext || "none"}' not allowed` });
-  }
-
-  // Reject .env files (but allow .env.example)
-  if (base === ".env" || (base.startsWith(".env.") && !base.endsWith(".example"))) {
-    return res.status(403).json({ error: "env files not allowed" });
-  }
-
-  const MAX_SIZE = 500 * 1024; // 500KB
-
-  try {
-    const st = await stat(resolved);
-    if (!st.isFile()) return res.status(400).json({ error: "not a file" });
-    if (st.size > MAX_SIZE) {
-      return res.status(413).json({ error: "file too large", size: st.size });
-    }
-
-    const content = await readFile(resolved, "utf-8");
-    res.json({ content, extension: ext, size: st.size });
-  } catch (err: any) {
-    if (err.code === "ENOENT") return res.status(404).json({ error: "file not found" });
-    if (err.code === "EACCES") return res.status(403).json({ error: "permission denied" });
-    res.status(500).json({ error: err.message || "failed to read file" });
-  }
-});
-
-// ============================================================
-// Routes — Agent Spawning
-// ============================================================
-
-const spawnedProcesses = new Map<string, ChildProcess>();
-
-app.post("/api/spawn", (req, res) => {
-  const { prompt, projectPath, agentType } = req.body;
-  if (!prompt) return res.status(400).json({ error: "prompt required" });
-
-  const spawnId = `spawn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const friendlyName = agentType ? agentTypeFriendlyName(agentType) : "Subagent";
-
-  // Create a real AgentState immediately so it appears in the city
-  const agentState: AgentState = {
-    agentId: spawnId,
-    displayName: friendlyName,
-    source: "claude",
-    isThinking: true,
-    currentCommand: undefined,
-    toolInput: undefined,
-    lastActivity: Date.now(),
-    status: "thinking",
-    waitingForApproval: false,
-    agentKind: "subagent",
-    agentType: agentType || undefined,
-    spawnId,
-  };
-  agents.set(spawnId, agentState);
-  broadcast("activity", { agent: agentState });
-
-  try {
-    const args = ["-p", prompt];
-    const cwd = projectPath || process.cwd();
-
-    const child = spawn("claude", args, {
-      cwd,
-      env: cleanEnvForClaude(),
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-    });
-
-    let output = "";
-
-    child.stdout?.on("data", (chunk: Buffer) => {
-      output += chunk.toString();
-      // Keep agent alive while producing output
-      const agent = agents.get(spawnId);
-      if (agent) agent.lastActivity = Date.now();
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      output += chunk.toString();
-    });
-
-    child.on("close", (code) => {
-      spawnedProcesses.delete(spawnId);
-
-      // Set agent to idle briefly, then remove after 10s
-      const agent = agents.get(spawnId);
-      if (agent) {
-        agent.status = "idle";
-        agent.isThinking = false;
-        agent.currentCommand = undefined;
-        agent.toolInput = undefined;
-        agent.lastActivity = Date.now();
-        broadcastThrottled("activity", { agent });
-
-        setTimeout(() => {
-          agents.delete(spawnId);
-          broadcast("agent-removed", { agentId: spawnId });
-          // Clean up reverse mapping
-          for (const [sid, sid2] of sessionToSpawnId) {
-            if (sid2 === spawnId) sessionToSpawnId.delete(sid);
-          }
-        }, 10_000);
-      }
-
-      broadcast("spawn-complete", {
-        spawnId,
-        code,
-        output: output.slice(0, 2000),
-      });
-    });
-
-    child.unref();
-    spawnedProcesses.set(spawnId, child);
-
-    broadcast("spawn-started", {
-      spawnId,
-      prompt: prompt.slice(0, 100),
-      projectPath: cwd,
-      agentType,
-    });
-
-    res.json({ ok: true, spawnId });
-  } catch (err: any) {
-    // Remove agent on spawn failure
-    agents.delete(spawnId);
-    broadcast("agent-removed", { agentId: spawnId });
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/spawn/active", (_req, res) => {
-  const active = Array.from(spawnedProcesses.entries()).map(([id, p]) => ({
-    spawnId: id,
-    pid: p.pid,
-  }));
-  res.json({ active });
-});
-
-app.post("/api/history/reindex", async (_req, res) => {
-  try {
-    await indexer.indexAll();
-    const stats = indexer.getStats();
-    res.json({ ok: true, stats });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 // ============================================================
 // Routes — General
@@ -1954,12 +1405,6 @@ app.post("/api/tts/assign", (req, res) => {
 });
 
 // ============================================================
-// Chat — Session watcher state (entries cleared by session-end hook)
-// ============================================================
-
-const chatWatchers = new Map<string, ReturnType<typeof setInterval>>();
-
-// ============================================================
 // Voice — Session file watcher (detect assistant messages)
 // ============================================================
 
@@ -2122,110 +1567,6 @@ async function maybeWatchAgent(agentId: string) {
 }
 
 // ============================================================
-// Weather — project health → weather state
-// ============================================================
-
-type WeatherState = "clear" | "fog" | "rain" | "storm" | "snow" | "aurora";
-
-interface WeatherInfo {
-  state: WeatherState;
-  reason: string;
-  lastCheck: number;
-}
-
-let currentWeather: WeatherInfo = {
-  state: "clear",
-  reason: "Default — all clear",
-  lastCheck: Date.now(),
-};
-
-function computeWeather(): WeatherInfo {
-  const now = Date.now();
-  const agentList = Array.from(agents.values());
-
-  // If no agents at all → clear
-  if (agentList.length === 0) {
-    return { state: "clear", reason: "No agents active", lastCheck: now };
-  }
-
-  // All agents idle? → snow (peaceful)
-  const allIdle = agentList.every(
-    (a) => a.status === "idle" && !a.waitingForApproval
-  );
-  if (allIdle) {
-    return { state: "snow", reason: "All agents resting", lastCheck: now };
-  }
-
-  // Any agent stuck / waiting for approval? → rain
-  const stuckCount = agentList.filter(
-    (a) => a.status === "stuck" || a.waitingForApproval
-  ).length;
-
-  if (stuckCount >= 2) {
-    return {
-      state: "storm",
-      reason: `${stuckCount} agents stuck — storm!`,
-      lastCheck: now,
-    };
-  }
-
-  if (stuckCount === 1) {
-    return {
-      state: "rain",
-      reason: "Agent waiting for approval",
-      lastCheck: now,
-    };
-  }
-
-  // Many agents writing simultaneously → aurora (busy deploy)
-  const writingCount = agentList.filter((a) => a.status === "writing").length;
-  if (writingCount >= 3) {
-    return {
-      state: "aurora",
-      reason: `${writingCount} agents writing — deploy in progress`,
-      lastCheck: now,
-    };
-  }
-
-  // Many agents thinking → fog (processing)
-  const thinkingCount = agentList.filter((a) => a.status === "thinking").length;
-  if (thinkingCount >= 2) {
-    return {
-      state: "fog",
-      reason: `${thinkingCount} agents thinking`,
-      lastCheck: now,
-    };
-  }
-
-  // Default: clear
-  return { state: "clear", reason: "Normal operations", lastCheck: now };
-}
-
-// Recompute weather every 3 seconds and broadcast changes
-setInterval(() => {
-  const prev = currentWeather.state;
-  currentWeather = computeWeather();
-  if (currentWeather.state !== prev) {
-    broadcast("weather", currentWeather);
-  }
-}, 3000);
-
-app.get("/api/weather", (_req, res) => {
-  res.json(currentWeather);
-});
-
-app.post("/api/weather/set", (req, res) => {
-  const { state, reason } = req.body;
-  const valid: WeatherState[] = ["clear", "fog", "rain", "storm", "snow", "aurora"];
-  if (!valid.includes(state)) {
-    return res.status(400).json({ error: "Invalid weather state" });
-  }
-  currentWeather = { state, reason: reason || "Manual override", lastCheck: Date.now() };
-  broadcast("weather", currentWeather);
-  res.json(currentWeather);
-});
-
-// ============================================================
 // Idle cleanup
 // ============================================================
 
@@ -2264,6 +1605,12 @@ const PORT = parseInt(process.env.SERVER_PORT || "5174");
 server.listen(PORT, () => {
   console.log(`Neon City server on http://localhost:${PORT}`);
   console.log(`WebSocket on ws://localhost:${PORT}/ws`);
+
+  // Keep the indexed project/session database warm for history and project views.
+  indexer.indexAll().catch((err) => {
+    console.error("[Indexer] Initial index failed:", err);
+  });
+  indexer.startWatching();
 
   // TTS worker starts on-demand when voice is first enabled (not on boot)
   // startTTSWorker();

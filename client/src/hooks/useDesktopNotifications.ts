@@ -25,19 +25,19 @@ export function useDesktopNotifications(subscribeToMessages: SubscribeFn) {
         if (n.type === "approval-needed") {
           new Notification("Neon City — Approval Needed", {
             body: `${n.agentName}: ${n.description}`,
-            icon: "/favicon.ico",
+            icon: "/favicon.svg",
             tag: n.id,
           });
         } else if (n.type === "task-complete") {
           new Notification("Neon City — Task Complete", {
             body: `${n.agentName}: ${n.description}`,
-            icon: "/favicon.ico",
+            icon: "/favicon.svg",
             tag: n.id,
           });
         } else if (n.type === "error") {
           new Notification("Neon City — Error", {
             body: `${n.agentName}: ${n.description}`,
-            icon: "/favicon.ico",
+            icon: "/favicon.svg",
             tag: n.id,
           });
         }
@@ -46,7 +46,7 @@ export function useDesktopNotifications(subscribeToMessages: SubscribeFn) {
       if (msg.type === "spawn-complete") {
         new Notification("Neon City — Agent Finished", {
           body: "Agent completed its task",
-          icon: "/favicon.ico",
+          icon: "/favicon.svg",
         });
       }
     });

@@ -1,25 +1,52 @@
 import { useEffect, useState, useRef, useCallback } from "react";
-import { useHistory, type HistorySession, type HistoryMessage } from "../hooks/useHistory";
+import { useHistory, type HistoryEvent, type HistorySession } from "../hooks/useHistory";
+import type { RawMessageListener } from "../hooks/useCityState";
 
 interface Props {
   open: boolean;
   onClose: () => void;
+  subscribeToMessages: (listener: RawMessageListener) => () => void;
 }
 
-type Tab = "sessions" | "search" | "plans";
+type Tab = "sessions" | "search" | "plans" | "events";
 
-export function HistoryDrawer({ open, onClose }: Props) {
+const EVENT_TYPE_OPTIONS = [
+  "PermissionRequest",
+  "PostToolUseFailure",
+  "SubagentStart",
+  "SubagentStop",
+  "SessionStart",
+  "SessionEnd",
+  "PreToolUse",
+  "PostToolUse",
+] as const;
+
+function renderSearchSnippet(snippet: string) {
+  const parts = snippet.split(/(<mark>.*?<\/mark>)/g).filter(Boolean);
+  return parts.map((part, index) => {
+    if (part.startsWith("<mark>") && part.endsWith("</mark>")) {
+      return <mark key={`${part}-${index}`}>{part.slice(6, -7)}</mark>;
+    }
+    return <span key={`${part}-${index}`}>{part}</span>;
+  });
+}
+
+export function HistoryDrawer({ open, onClose, subscribeToMessages }: Props) {
   const {
-    projects, sessions, messages, searchResults, plans, stats, loading,
-    fetchProjects, fetchSessions, fetchSessionMessages, search, fetchPlans, fetchStats,
+    projects, sessions, messages, searchResults, plans, events, eventsTotal, eventsHasMore, eventsCursor, stats, loading,
+    fetchProjects, fetchSessions, fetchSessionMessages, search, fetchPlans, fetchEvents, appendEventsPage, fetchStats, prependEvent,
   } = useHistory();
 
   const [tab, setTab] = useState<Tab>("sessions");
   const [selectedProject, setSelectedProject] = useState<number | undefined>();
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [eventProjectPath, setEventProjectPath] = useState("");
+  const [eventTypeFilter, setEventTypeFilter] = useState("");
+  const [approvalOnly, setApprovalOnly] = useState(false);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const EVENTS_PAGE_SIZE = 25;
 
   // Load data when drawer opens
   useEffect(() => {
@@ -28,12 +55,32 @@ export function HistoryDrawer({ open, onClose }: Props) {
     fetchStats();
     fetchSessions(undefined);
     fetchPlans();
-  }, [open, fetchProjects, fetchStats, fetchSessions, fetchPlans]);
+    fetchEvents({ limit: EVENTS_PAGE_SIZE });
+  }, [open, fetchProjects, fetchStats, fetchSessions, fetchPlans, fetchEvents]);
 
   // Fetch sessions when project filter changes
   useEffect(() => {
     if (open) fetchSessions(selectedProject);
   }, [selectedProject, open, fetchSessions]);
+
+  useEffect(() => {
+    if (!open || tab !== "events") return;
+    fetchEvents({
+      limit: EVENTS_PAGE_SIZE,
+      eventType: eventTypeFilter || undefined,
+      projectPath: eventProjectPath || undefined,
+      approvalOnly,
+    });
+  }, [open, tab, eventProjectPath, eventTypeFilter, approvalOnly, fetchEvents]);
+
+  useEffect(() => {
+    if (!open) return;
+    return subscribeToMessages((msg) => {
+      if (msg.type === "event" && msg.data) {
+        prependEvent(msg.data as HistoryEvent);
+      }
+    });
+  }, [open, prependEvent, subscribeToMessages]);
 
   // Scroll to bottom of messages
   useEffect(() => {
@@ -72,6 +119,37 @@ export function HistoryDrawer({ open, onClose }: Props) {
     return s.length > len ? s.slice(0, len) + "..." : s;
   };
 
+  const formatEventTitle = (event: HistoryEvent) => {
+    if (event.eventType === "PermissionRequest") return "Approval requested";
+    if (event.eventType === "PostToolUseFailure") return "Tool failed";
+    if (event.eventType === "SubagentStart") return "Agent started";
+    if (event.eventType === "SubagentStop") return "Agent finished";
+    if (event.eventType === "SessionStart") return "Session started";
+    if (event.eventType === "SessionEnd") return "Session ended";
+    return event.eventType;
+  };
+
+  const formatEventSummary = (event: HistoryEvent) => {
+    if (event.reason) return event.reason;
+    if (event.toolName) return `${event.toolName} in ${event.projectName || "workspace"}`;
+    if (typeof event.payload.message === "string") return event.payload.message;
+    if (typeof event.payload.description === "string") return event.payload.description;
+    if (event.projectName) return `Activity in ${event.projectName}`;
+    return "Recent Claude activity";
+  };
+
+  const handleLoadMoreEvents = () => {
+    if (!eventsCursor) return;
+    appendEventsPage({
+      limit: EVENTS_PAGE_SIZE,
+      eventType: eventTypeFilter || undefined,
+      projectPath: eventProjectPath || undefined,
+      approvalOnly,
+      beforeTimestamp: eventsCursor.beforeTimestamp,
+      beforeId: eventsCursor.beforeId,
+    });
+  };
+
   return (
     <div className={`history-drawer ${open ? "open" : ""}`}>
       {/* Handle */}
@@ -93,13 +171,13 @@ export function HistoryDrawer({ open, onClose }: Props) {
 
         {/* Tabs */}
         <div className="drawer-tabs">
-          {(["sessions", "search", "plans"] as Tab[]).map((t) => (
+          {(["sessions", "search", "plans", "events"] as Tab[]).map((t) => (
             <button
               key={t}
               className={`drawer-tab ${tab === t ? "active" : ""}`}
               onClick={() => setTab(t)}
             >
-              {t === "sessions" ? "Sessions" : t === "search" ? "Search" : "Plans"}
+              {t === "sessions" ? "Sessions" : t === "search" ? "Search" : t === "plans" ? "Plans" : "Events"}
             </button>
           ))}
         </div>
@@ -128,12 +206,21 @@ export function HistoryDrawer({ open, onClose }: Props) {
             {/* Session list */}
             <div className="drawer-list">
               {loading && sessions.length === 0 && (
-                <div className="drawer-empty">Indexing sessions...</div>
+                <div className="drawer-empty drawer-empty-rich">
+                  <div className="drawer-empty-icon">⌛</div>
+                  <div className="drawer-empty-title">Building session history</div>
+                  <div className="drawer-empty-copy">
+                    Neon City is indexing Claude sessions so search, plans, and project history can open with real context.
+                  </div>
+                </div>
               )}
               {!loading && sessions.length === 0 && (
-                <div className="drawer-empty">
+                <div className="drawer-empty drawer-empty-rich">
                   <div className="drawer-empty-icon">📭</div>
-                  No sessions found
+                  <div className="drawer-empty-title">No sessions found</div>
+                  <div className="drawer-empty-copy">
+                    Try a different project filter, or start a Claude session in one of your workspaces to populate this view.
+                  </div>
                 </div>
               )}
               {sessions.map((s) => (
@@ -200,9 +287,19 @@ export function HistoryDrawer({ open, onClose }: Props) {
               />
             </div>
             <div className="drawer-list">
-              {loading && <div className="drawer-empty">Searching...</div>}
+              {loading && (
+                <div className="drawer-empty drawer-empty-rich">
+                  <div className="drawer-empty-icon">⌕</div>
+                  <div className="drawer-empty-title">Searching history</div>
+                  <div className="drawer-empty-copy">Scanning indexed sessions, plans, and messages for the best matches.</div>
+                </div>
+              )}
               {!loading && searchQuery && searchResults.length === 0 && (
-                <div className="drawer-empty">No results for "{searchQuery}"</div>
+                <div className="drawer-empty drawer-empty-rich">
+                  <div className="drawer-empty-icon">∅</div>
+                  <div className="drawer-empty-title">No results for "{searchQuery}"</div>
+                  <div className="drawer-empty-copy">Try a tool name, file path, branch term, or a shorter phrase from the conversation.</div>
+                </div>
               )}
               {searchResults.map((r) => (
                 <button
@@ -223,8 +320,9 @@ export function HistoryDrawer({ open, onClose }: Props) {
                   </div>
                   <div
                     className="search-result-snippet"
-                    dangerouslySetInnerHTML={{ __html: r.snippet }}
-                  />
+                  >
+                    {renderSearchSnippet(r.snippet)}
+                  </div>
                   {r.session_title && (
                     <div className="search-result-session">
                       {truncate(r.session_title, 60)}
@@ -240,9 +338,10 @@ export function HistoryDrawer({ open, onClose }: Props) {
         {tab === "plans" && (
           <div className="drawer-list">
             {plans.length === 0 && (
-              <div className="drawer-empty">
+              <div className="drawer-empty drawer-empty-rich">
                 <div className="drawer-empty-icon">📋</div>
-                No plans found
+                <div className="drawer-empty-title">No plans found</div>
+                <div className="drawer-empty-copy">Plans appear here after Claude creates or updates markdown planning files in your indexed workspaces.</div>
               </div>
             )}
             {plans.map((p) => (
@@ -258,6 +357,89 @@ export function HistoryDrawer({ open, onClose }: Props) {
               </div>
             ))}
           </div>
+        )}
+
+        {tab === "events" && (
+          <>
+            <div className="drawer-filter drawer-filter-events">
+              <select
+                name="event-project-filter"
+                className="drawer-select"
+                value={eventProjectPath}
+                onChange={(e) => setEventProjectPath(e.target.value)}
+              >
+                <option value="">All workspaces</option>
+                {projects.map((project) => (
+                  <option key={project.path} value={project.path}>{project.name}</option>
+                ))}
+              </select>
+              <select
+                name="event-type-filter"
+                className="drawer-select"
+                value={eventTypeFilter}
+                onChange={(e) => setEventTypeFilter(e.target.value)}
+              >
+                <option value="">All event types</option>
+                {EVENT_TYPE_OPTIONS.map((eventType) => (
+                  <option key={eventType} value={eventType}>{eventType}</option>
+                ))}
+              </select>
+              <button
+                className={`drawer-toggle-chip ${approvalOnly ? "active" : ""}`}
+                onClick={() => setApprovalOnly((current) => !current)}
+                type="button"
+              >
+                Approval Only
+              </button>
+            </div>
+            <div className="drawer-list">
+            {loading && events.length === 0 && (
+              <div className="drawer-empty drawer-empty-rich">
+                <div className="drawer-empty-icon">⚡</div>
+                <div className="drawer-empty-title">Loading recent events</div>
+                <div className="drawer-empty-copy">Collecting approvals, failures, agent lifecycle, and session activity from the event stream.</div>
+              </div>
+            )}
+            {!loading && events.length === 0 && (
+              <div className="drawer-empty drawer-empty-rich">
+                <div className="drawer-empty-icon">🛰️</div>
+                <div className="drawer-empty-title">No matching events</div>
+                <div className="drawer-empty-copy">Try clearing one of the filters, or start a Claude session using the hook-backed event pipeline.</div>
+              </div>
+            )}
+            {events.map((event) => (
+              <div key={event.id} className="history-event-card">
+                <div className="history-event-header">
+                  <span className="history-event-title">{formatEventTitle(event)}</span>
+                  <span className="session-time">{formatTime(event.timestamp)}</span>
+                </div>
+                <div className="history-event-summary">{formatEventSummary(event)}</div>
+                <div className="history-event-meta">
+                  {event.projectName && <span className="session-project">{event.projectName}</span>}
+                  {event.toolName && <span className="history-event-badge">{event.toolName}</span>}
+                  {event.status && <span className="history-event-badge">{event.status}</span>}
+                  {event.agentType && <span className="history-event-badge">{event.agentType}</span>}
+                </div>
+              </div>
+            ))}
+            {events.length > 0 && (
+              <div className="history-events-footer">
+                <span className="session-time">
+                  Showing {events.length} of {eventsTotal}
+                </span>
+                {eventsHasMore && (
+                  <button
+                    className="drawer-toggle-chip"
+                    onClick={handleLoadMoreEvents}
+                    type="button"
+                  >
+                    Load More
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          </>
         )}
       </div>
     </div>

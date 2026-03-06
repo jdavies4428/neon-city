@@ -1,5 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
+import type { ReactNode, ReactElement } from "react";
 import { basename } from "../shared/format";
+import { GitStatusBar } from "./GitStatusBar";
 
 interface TreeEntry {
   name: string;
@@ -25,9 +27,9 @@ interface Props {
 
 // ─── Minimal Markdown Renderer ─────────────────────────────
 
-function renderMarkdown(content: string): JSX.Element {
+function renderMarkdown(content: string): ReactElement {
   const lines = content.split("\n");
-  const elements: JSX.Element[] = [];
+  const elements: ReactElement[] = [];
   let i = 0;
   let key = 0;
 
@@ -140,7 +142,7 @@ function renderMarkdown(content: string): JSX.Element {
   return <>{elements}</>;
 }
 
-function inlineFormat(text: string): React.ReactNode {
+function inlineFormat(text: string): ReactNode {
   // Process inline code, bold, italic, links
   const parts: React.ReactNode[] = [];
   let remaining = text;
@@ -243,8 +245,6 @@ export function ProjectDetailModal({ open, onClose, project, onOpenProject }: Pr
   const [fileLoading, setFileLoading] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
 
-  const [opening, setOpening] = useState(false);
-
   // Load root tree when project changes
   useEffect(() => {
     if (!open || !project?.path) return;
@@ -253,7 +253,6 @@ export function ProjectDetailModal({ open, onClose, project, onOpenProject }: Pr
     setSelectedFile(null);
     setFileContent(null);
     setFileError(null);
-    setOpening(false);
     loadTree(project.path);
   }, [open, project?.path]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -331,29 +330,10 @@ export function ProjectDetailModal({ open, onClose, project, onOpenProject }: Pr
     }
   }
 
-  async function handleOpenProject() {
-    if (!project?.path || opening) return;
-    setOpening(true);
-
-    try {
-      await fetch("/api/spawn", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: "You are now working on this project. Explore the codebase and wait for instructions.",
-          projectPath: project.path,
-          agentType: "general-purpose",
-        }),
-      });
-      // Close modal after short delay to let the agent appear
-      setTimeout(() => {
-        onOpenProject(project.path);
-        onClose();
-        setOpening(false);
-      }, 800);
-    } catch {
-      setOpening(false);
-    }
+  function handleOpenProject() {
+    if (!project?.path) return;
+    onOpenProject(project.path);
+    onClose();
   }
 
   // Escape key
@@ -368,7 +348,7 @@ export function ProjectDetailModal({ open, onClose, project, onOpenProject }: Pr
 
   if (!open || !project) return null;
 
-  function renderEntry(entry: TreeEntry, depth: number): JSX.Element {
+  function renderEntry(entry: TreeEntry, depth: number): ReactElement {
     const isDir = entry.type === "dir";
     const isExpanded = expandedDirs.has(entry.path);
     const isSelected = selectedFile === entry.path;
@@ -409,6 +389,9 @@ export function ProjectDetailModal({ open, onClose, project, onOpenProject }: Pr
             {"\u00D7"}
           </button>
         </div>
+
+        {/* Git Status */}
+        <GitStatusBar projectPath={project.path} projectName={project.name} />
 
         {/* Body */}
         <div className="project-detail-body">
@@ -456,9 +439,8 @@ export function ProjectDetailModal({ open, onClose, project, onOpenProject }: Pr
           <button
             className="open-project-btn"
             onClick={handleOpenProject}
-            disabled={opening}
           >
-            {opening ? "OPENING..." : "OPEN PROJECT"}
+            OPEN PROJECT
           </button>
         </div>
       </div>

@@ -10,6 +10,7 @@ import { existsSync, statSync } from "fs";
 import type Database from "better-sqlite3";
 import { getDb } from "./db.js";
 import { parseSessionFile } from "./session-parser.js";
+import { decodeClaudeProjectDir, resolveClaudeProjectPath } from "../project-paths.js";
 
 const CLAUDE_DIR = join(homedir(), ".claude");
 const PROJECTS_DIR = join(CLAUDE_DIR, "projects");
@@ -92,16 +93,24 @@ export class Indexer {
   }
 
   private async indexProject(dirName: string, dirPath: string) {
-    const projectPath = decodeProjectDir(dirName);
+    const projectPath = await resolveClaudeProjectPath(dirName, dirPath);
     const projectName = basename(projectPath);
 
-    // Upsert project
-    this.db.prepare(`
-      INSERT INTO projects (path, name, dir_name) VALUES (?, ?, ?)
-      ON CONFLICT(path) DO UPDATE SET name = excluded.name
-    `).run(projectPath, projectName, dirName);
+    const existingProject = this.db.prepare("SELECT id, path FROM projects WHERE dir_name = ?").get(dirName) as any;
+    if (existingProject) {
+      this.db.prepare(`
+        UPDATE projects
+        SET path = ?, name = ?, dir_name = ?
+        WHERE id = ?
+      `).run(projectPath, projectName, dirName, existingProject.id);
+    } else {
+      this.db.prepare(`
+        INSERT INTO projects (path, name, dir_name) VALUES (?, ?, ?)
+        ON CONFLICT(path) DO UPDATE SET name = excluded.name, dir_name = excluded.dir_name
+      `).run(projectPath, projectName, dirName);
+    }
 
-    const project = this.db.prepare("SELECT id FROM projects WHERE path = ?").get(projectPath) as any;
+    const project = this.db.prepare("SELECT id FROM projects WHERE dir_name = ?").get(dirName) as any;
     if (!project) return;
 
     const projectId = project.id;
@@ -407,5 +416,5 @@ export class Indexer {
 }
 
 function decodeProjectDir(dirName: string): string {
-  return dirName.replace(/^-/, "/").replace(/-/g, "/");
+  return decodeClaudeProjectDir(dirName);
 }

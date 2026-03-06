@@ -12,10 +12,12 @@
     "dev": "concurrently \"npm run dev -w server\" \"npm run dev -w client\"",
     "build": "npm run build -w server && npm run build -w client",
     "test": "npm run test -w server && npm run test -w client",
+    "test:e2e": "playwright test",
     "setup": "node bin/setup.js",
     "setup:uninstall": "node bin/setup.js --uninstall"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "concurrently": "^9.1.2",
     "typescript": "^5.7.3"
   }

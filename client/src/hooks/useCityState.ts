@@ -12,6 +12,8 @@ export interface AgentState {
   agentKind?: "session" | "subagent";
   agentType?: string;
   colorIndex?: number;
+  model?: string;           // "claude-opus-4-6", "claude-sonnet-4-6", etc.
+  sessionSource?: "startup" | "resume" | "clear" | "compact";
 }
 
 export interface WeatherInfo {
@@ -132,6 +134,7 @@ export function useCityState() {
   const subscribe = useCallback(
     (listener: (state: CityState) => void) => {
       listenersRef.current.add(listener);
+      listener(stateRef.current);
       return () => { listenersRef.current.delete(listener); };
     },
     []

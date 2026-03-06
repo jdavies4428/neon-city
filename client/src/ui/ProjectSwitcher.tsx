@@ -47,20 +47,6 @@ export function ProjectSwitcher({ open, onClose, onSelectProject, currentWeather
     return new Date(ts).toLocaleDateString("en-US", { month: "short", day: "numeric" });
   };
 
-  const handleOpenProject = async (projectPath: string) => {
-    try {
-      await fetch("/api/chat/send", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: `cd ${projectPath} && echo "Switched to ${projectPath}"`,
-        }),
-      });
-    } catch {
-      // Best effort
-    }
-  };
-
   const handleNewProject = async () => {
     const name = newProjectName.trim();
     if (!name || creating) return;
@@ -145,7 +131,6 @@ export function ProjectSwitcher({ open, onClose, onSelectProject, currentWeather
                   onProjectDetail(p);
                 } else {
                   onSelectProject(p);
-                  handleOpenProject(p.path || p.name);
                   onClose();
                 }
               }}

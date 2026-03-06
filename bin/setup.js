@@ -46,8 +46,7 @@ const HTTP_HOOKS = [
   { event: "PreToolUse", url: `${BASE_URL}/pre-tool-use`, timeout: 5 },
   { event: "PostToolUse", url: `${BASE_URL}/post-tool-use`, timeout: 5 },
   { event: "PostToolUseFailure", url: `${BASE_URL}/post-tool-use-failure`, timeout: 5 },
-  // PermissionRequest intentionally excluded — it blocks tool execution
-  // until the Neon City UI approves, which deadlocks if the UI is unavailable.
+  { event: "PermissionRequest", url: `${BASE_URL}/permission-request`, timeout: 120 },
 ];
 
 /**
